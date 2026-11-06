@@ -3494,3 +3494,46 @@ kbd {
   font-size: 12px;
   margin: 0;
 }
+
+.assistant-controls {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+.assistant-controls textarea {
+  width: 100%;
+  min-height: 52px;
+  padding: 7px 8px;
+  resize: vertical;
+  border: 1px solid #424046;
+  border-radius: 5px;
+  background: #202024;
+  color: #e2dcd6;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.assistant-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.assistant-panel .cleanup-progress {
+  margin: 8px 0;
+}
+.assistant-conversation {
+  margin-top: 12px;
+  border-top: 1px solid #333338;
+}
+.assistant-conversation h3 {
+  font-size: 11px;
+  margin: 9px 0;
+}
+.assistant-history {
+  max-height: 250px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.assistant-history .chat-message p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -360,19 +360,28 @@ struct Reply {
     retakes: Vec<Retake>,
 }
 
-fn schema() -> Value {
-    let range = json!({
+pub(super) fn utterance_range_schema() -> Value {
+    json!({
         "type": "object", "properties": {"first": {"type": "integer"}, "last": {"type": "integer"}},
         "required": ["first", "last"], "additionalProperties": false
-    });
-    json!({
+    })
+}
+
+fn retake_task() -> Task<'static> {
+    let range = utterance_range_schema();
+    let schema = json!({
         "type": "object",
         "properties": {"retakes": {"type": "array", "items": {
             "type": "object", "properties": {"keep": range, "remove": range},
             "required": ["keep", "remove"], "additionalProperties": false
         }}},
         "required": ["retakes"], "additionalProperties": false
-    })
+    });
+    Task {
+        name: "retakes",
+        instructions: INSTRUCTIONS,
+        schema,
+    }
 }
 
 const INSTRUCTIONS: &str = "Find duplicate spoken takes in the ordered timeline transcript. \
@@ -385,23 +394,33 @@ IDs, inclusive, and a keep must never also be removed. Return only JSON in the f
 {\"retakes\":[{\"keep\":{\"first\":1,\"last\":1},\"remove\":{\"first\":2,\"last\":2}}]}. \
 Return {\"retakes\":[]} if there are no confident matches.";
 
+pub(super) struct Task<'a> {
+    pub name: &'static str,
+    pub instructions: &'a str,
+    pub schema: Value,
+}
+
 impl Connection {
-    fn request(&self, client: &Client, transcript: &str) -> reqwest::RequestBuilder {
+    fn request(&self, client: &Client, input: &str, task: Task<'_>) -> reqwest::RequestBuilder {
         let model = &self.config.model;
-        let schema = schema();
+        let Task {
+            name,
+            instructions,
+            schema,
+        } = task;
         let (url, body) = match self.provider {
             Provider::OpenAi => (
                 "https://api.openai.com/v1/responses".into(),
                 json!({
-                    "model": model, "instructions": INSTRUCTIONS, "input": transcript, "store": false,
+                    "model": model, "instructions": instructions, "input": input, "store": false,
                     "max_output_tokens": 4096,
-                    "text": {"format": {"type": "json_schema", "name": "retakes", "strict": true, "schema": schema}}
+                    "text": {"format": {"type": "json_schema", "name": name, "strict": true, "schema": schema}}
                 }),
             ),
             Provider::Anthropic => (
                 "https://api.anthropic.com/v1/messages".into(),
                 json!({
-                    "model": model, "system": INSTRUCTIONS, "messages": [{"role": "user", "content": transcript}],
+                    "model": model, "system": instructions, "messages": [{"role": "user", "content": input}],
                     "max_tokens": 4096, "output_config": {"format": {"type": "json_schema", "schema": schema}}
                 }),
             ),
@@ -410,7 +429,7 @@ impl Connection {
                     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                 ),
                 json!({
-                    "systemInstruction": {"parts": [{"text": INSTRUCTIONS}]}, "contents": [{"parts": [{"text": transcript}]}],
+                    "systemInstruction": {"parts": [{"text": instructions}]}, "contents": [{"parts": [{"text": input}]}],
                     "generationConfig": {"responseMimeType": "application/json", "responseJsonSchema": schema, "maxOutputTokens": 4096}
                 }),
             ),
@@ -420,7 +439,7 @@ impl Connection {
                     self.config.base_url.as_deref().unwrap()
                 ),
                 json!({
-                    "model": model, "messages": [{"role": "system", "content": INSTRUCTIONS}, {"role": "user", "content": transcript}],
+                    "model": model, "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": input}],
                     "max_tokens": 4096, "stream": false
                 }),
             ),
@@ -452,6 +471,16 @@ impl Connection {
         if transcript.len() > super::TRANSCRIPT_LIMIT {
             return Err(super::TRANSCRIPT_TOO_LARGE.into());
         }
+        let reply = self.complete(transcript, retake_task(), cancel).await?;
+        parse_retakes(&reply)
+    }
+
+    pub(super) async fn complete(
+        &self,
+        input: &str,
+        task: Task<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
@@ -472,13 +501,13 @@ impl Connection {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err("Timeline analysis cancelled.".into()),
-            result = self.send(&client, transcript) => result,
+            result = self.send(&client, input, task) => result,
         }
     }
 
-    async fn send(&self, client: &Client, transcript: &str) -> Result<Vec<Retake>, String> {
+    async fn send(&self, client: &Client, input: &str, task: Task<'_>) -> Result<String, String> {
         let mut response = self
-            .request(client, transcript)
+            .request(client, input, task)
             .send()
             .await
             .map_err(|error| {
@@ -527,12 +556,12 @@ impl Connection {
         }
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "The AI provider returned an invalid response.")?;
-        parse_reply(self.provider, &value)
+        reply_text(self.provider, &value).map(str::to_owned)
     }
 }
 
-fn parse_reply(provider: Provider, value: &Value) -> Result<Vec<Retake>, String> {
-    let text = match provider {
+fn reply_text(provider: Provider, value: &Value) -> Result<&str, String> {
+    match provider {
         Provider::OpenAi if value["status"] == "completed" => value["output"]
             .as_array()
             .into_iter()
@@ -567,7 +596,10 @@ fn parse_reply(provider: Provider, value: &Value) -> Result<Vec<Retake>, String>
             }),
         _ => None,
     }
-    .ok_or("The AI provider returned an incomplete or refused analysis.")?;
+    .ok_or_else(|| "The AI provider returned an incomplete or refused analysis.".into())
+}
+
+fn parse_retakes(text: &str) -> Result<Vec<Retake>, String> {
     let reply: Reply = serde_json::from_str(text)
         .map_err(|_| "The AI provider returned invalid retake ranges.")?;
     if reply.retakes.len() > 100 {
@@ -579,6 +611,10 @@ fn parse_reply(provider: Provider, value: &Value) -> Result<Vec<Retake>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_reply(provider: Provider, value: &Value) -> Result<Vec<Retake>, String> {
+        parse_retakes(reply_text(provider, value)?)
+    }
 
     #[test]
     fn adapts_and_validates_all_four_provider_protocols() {
@@ -625,7 +661,10 @@ mod tests {
                 },
                 key: Some(secret_header("synthetic-secret").unwrap()),
             };
-            let request = connection.request(&client, transcript).build().unwrap();
+            let request = connection
+                .request(&client, transcript, retake_task())
+                .build()
+                .unwrap();
             assert_eq!(request.url().host_str(), Some(host));
             assert!(request.headers()[auth].is_sensitive());
             assert_eq!(request.headers()["content-type"], "application/json");

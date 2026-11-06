@@ -11,15 +11,18 @@ type Props = {
   progress: CleanupProgress | null;
   error: string;
   report: CleanupReport | null;
-  checked: ReadonlySet<number>;
-  saving: number;
-  invalidSelection: boolean;
   hasAudio: boolean;
-  previewing: boolean;
   onClose: () => void;
   onSettings: (tab?: 'speech' | 'providers') => void;
   onAnalyze: (options: { pauses: boolean; retakes: ProviderSelection | null }) => void;
   onCancel: () => void;
+} & CutReviewProps;
+
+export type CutReviewProps = {
+  checked: ReadonlySet<number>;
+  saving: number;
+  invalidSelection: boolean;
+  previewing: boolean;
   onToggle: (index: number) => void;
   onSelectPauses: () => void;
   onAudition: (range: TimeRange) => void;
@@ -28,9 +31,8 @@ type Props = {
 };
 
 export function CleanupPanel({
-  providerRevision, progress, error, report, checked, saving, invalidSelection,
-  hasAudio, previewing, onClose, onSettings, onAnalyze, onCancel,
-  onToggle, onSelectPauses, onAudition, onPreview, onApply,
+  providerRevision, progress, error, report, hasAudio, onClose, onSettings, onAnalyze, onCancel,
+  ...review
 }: Props) {
   const [pauses, setPauses] = useState(true);
   const [retakes, setRetakes] = useState(false);
@@ -101,67 +103,89 @@ export function CleanupPanel({
               }}>{report ? 'Analyze again' : 'Analyze timeline'}</button>
             </fieldset>
             {error && <p className="cleanup-warning" role="alert">{error}</p>}
-            {report?.retakeIssue && <p className="cleanup-warning" role="status">{report.retakeIssue}</p>}
-            {report?.transcriptCacheIssue && <p className="cleanup-warning" role="status">{report.transcriptCacheIssue}</p>}
-            {report?.runtimeNotice && <p className="cleanup-warning" role="status">{report.runtimeNotice}</p>}
-            {report?.speech && <p className="provider-note">Transcribed with {whisperModels[report.speech.model]} · {report.speech.device?.name ?? 'CPU'}</p>}
-            {!!report?.failedSources && (
-              <p className="cleanup-warning" role="status">
-                {report.failedSources} {report.failedSources === 1 ? 'source could' : 'sources could'} not be analyzed. Review the available results.
-              </p>
-            )}
-            {report && (
-              <section aria-label="Suggested cuts">
-                <div className="cleanup-results-heading">
-                  <h3>{report.proposals.length ? report.proposals.length + ' suggested cuts' : 'No cuts suggested'}</h3>
-                  {report.proposals.some((proposal) => proposal.kind === 'pause') && (
-                    <button type="button" className="text-link" onClick={onSelectPauses}>Select all pauses</button>
-                  )}
-                </div>
-                <ul className="cleanup-results">
-                  {report.proposals.map((proposal, index) => (
-                    <li key={index}>
-                      <label>
-                        <input type="checkbox" checked={checked.has(index)} onChange={() => onToggle(index)} />
-                        <span>{proposal.kind === 'pause' ? 'Quiet pause' : 'Repeated take'}</span>
-                      </label>
-                      <p className="cleanup-range">
-                        {timecode(proposal.remove.start)} – {timecode(proposal.remove.end)} · {(proposal.remove.end - proposal.remove.start).toFixed(2)} s
-                      </p>
-                      {proposal.keep && (
-                        <div className="cleanup-excerpts">
-                          <p><strong>Remove</strong> {proposal.removedText}</p>
-                          <p><strong>Keep</strong> {proposal.keptText}</p>
-                          <div>
-                            <button className="text-link" onClick={() => onAudition(proposal.remove)}>Play removed take</button>
-                            <button className="text-link" onClick={() => proposal.keep && onAudition(proposal.keep)}>Play kept take</button>
-                          </div>
-                        </div>
-                      )}
-                      <button className="text-link" disabled={!checked.has(index) || invalidSelection} onClick={() => onPreview(proposal.remove)}>Preview join</button>
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
+            {report && <CutReview report={report} {...review} />}
           </>
         )}
       </div>
-      {report && checked.size > 0 && (
-        <div className="cleanup-footer">
-          {invalidSelection ? (
-            <p className="cleanup-warning" role="status">This selection would leave an empty sequence or a fragment shorter than one frame. Deselect a cut to continue.</p>
-          ) : (
-            <p role="status">{checked.size} selected · {saving.toFixed(2)} s saved</p>
-          )}
-          <div>
-            <button className="button secondary" disabled={invalidSelection} onClick={() => onPreview()}>
-              {previewing ? 'Show original' : 'Preview selected'}
-            </button>
-            <button className="button primary" disabled={invalidSelection} onClick={onApply}>Apply selected</button>
-          </div>
-        </div>
-      )}
+      {!progress && report && <CutReviewActions {...review} />}
     </aside>
+  );
+}
+
+export function CutReview({
+  report, checked, invalidSelection, onToggle, onSelectPauses,
+  onAudition, onPreview, reviewingPauses = false, assistant = false,
+}: CutReviewProps & { report: CleanupReport; reviewingPauses?: boolean; assistant?: boolean }) {
+  return (
+    <>
+      {report.retakeIssue && <p className="cleanup-warning" role="status">{report.retakeIssue}</p>}
+      {report.transcriptCacheIssue && <p className="cleanup-warning" role="status">{report.transcriptCacheIssue}</p>}
+      {report.runtimeNotice && <p className="cleanup-warning" role="status">{report.runtimeNotice}</p>}
+      {report.speech && <p className="provider-note">Transcribed with {whisperModels[report.speech.model]} · {report.speech.device?.name ?? 'CPU'}</p>}
+      {!!report.failedSources && (
+        <p className="cleanup-warning" role="status">
+          {report.failedSources} {report.failedSources === 1 ? 'source could' : 'sources could'} not be analyzed. Review the available results.
+        </p>
+      )}
+      <section aria-label={reviewingPauses ? 'Suggested pauses' : 'Suggested cuts'}>
+        <div className="cleanup-results-heading">
+          <h3>{reviewingPauses
+            ? (report.proposals.length ? report.proposals.length + ' quiet gaps to review' : 'No pause removals suggested')
+            : (report.proposals.length ? report.proposals.length + ' suggested cuts' : 'No cuts suggested')}</h3>
+          {report.proposals.some((proposal) => proposal.kind === 'pause') && (
+            <button type="button" className="text-link" onClick={onSelectPauses}>Select all pauses</button>
+          )}
+        </div>
+        <ul className="cleanup-results">
+          {report.proposals.map((proposal, index) => (
+            <li key={index}>
+              <label>
+                <input type="checkbox" checked={checked.has(index)} onChange={() => onToggle(index)} />
+                <span>{proposal.kind === 'pause' ? 'Quiet pause' : proposal.kind === 'retake' ? 'Repeated take' : 'Transcript cut'}</span>
+              </label>
+              <p className="cleanup-range">
+                {timecode(proposal.remove.start)} – {timecode(proposal.remove.end)} · {(proposal.remove.end - proposal.remove.start).toFixed(2)} s
+              </p>
+              <div className="cleanup-excerpts">
+                {proposal.reason && <p>{proposal.reason}</p>}
+                {proposal.removedText && <p><strong>Remove</strong> {proposal.removedText}</p>}
+                {proposal.keptText && <p><strong>Keep</strong> {proposal.keptText}</p>}
+                <div>
+                  {(assistant || proposal.keep) && <button className="text-link" onClick={() => onAudition(proposal.remove)}>
+                    {proposal.keep ? 'Play removed take' : proposal.kind === 'pause' ? 'Play original gap' : 'Play proposed removal'}
+                  </button>}
+                  {proposal.keep && <button className="text-link" onClick={() => proposal.keep && onAudition(proposal.keep)}>Play kept take</button>}
+                  <button className="text-link" disabled={!checked.has(index) || invalidSelection} onClick={() => onPreview(proposal.remove)}>Preview join</button>
+                </div>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
+    </>
+  );
+}
+
+export function CutReviewActions({
+  checked, saving, invalidSelection, previewing, onPreview, onApply,
+  reviewingPauses = false, canApply = true,
+}: CutReviewProps & { reviewingPauses?: boolean; canApply?: boolean }) {
+  if (!checked.size) return null;
+  return (
+    <div className="cleanup-footer">
+      {invalidSelection ? (
+        <p className="cleanup-warning" role="status">This selection would leave an empty sequence or a fragment shorter than one frame. Deselect a cut to continue.</p>
+      ) : (
+        <p role="status">{checked.size} selected · {saving.toFixed(2)} s saved</p>
+      )}
+      <div>
+        <button className="button secondary" disabled={invalidSelection} onClick={() => onPreview()}>
+          {previewing ? 'Show original' : 'Preview selected'}
+        </button>
+        <button className="button primary" disabled={invalidSelection || !canApply} onClick={onApply}>
+          {reviewingPauses ? 'Apply pauses and find cuts' : 'Apply selected'}
+        </button>
+      </div>
+    </div>
   );
 }

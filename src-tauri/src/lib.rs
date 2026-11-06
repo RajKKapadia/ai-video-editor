@@ -84,6 +84,7 @@ pub fn run() {
             cleanup::cleanup_source_skip,
             cleanup::cleanup_finish,
             cleanup::cleanup_cancel,
+            cleanup::assistant::assistant_history,
             cleanup::speech::speech_status,
             cleanup::speech::speech_save,
             cleanup::speech::speech_prepare,

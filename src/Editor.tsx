@@ -9,11 +9,12 @@ import {
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { Brand } from './App';
+import { AssistantPanel } from './AssistantPanel';
 import { CleanupPanel } from './CleanupPanel';
 import { ExportPanel } from './ExportPanel';
 import { Icon, type IconName } from './Icon';
-import { analyzeTimeline, errorMessage, hasAnalyzableAudio, type CleanupProgress } from './cleanupNative';
-import { makeCleanupEdit, minSegmentDuration, type CleanupReport, type TimeRange } from './cleanupTimeline';
+import { analyzeTimeline, errorMessage, hasAnalyzableAudio, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
+import { makeCleanupEdit, minSegmentDuration, type AssistantMessage, type CleanupReport, type TimeRange } from './cleanupTimeline';
 import { inspectMedia, storeMedia } from './cache';
 import { importConcurrency, mapConcurrent } from './resources';
 import { TimelineRuler, useTimelineZoom } from './timelineView';
@@ -126,11 +127,13 @@ export function Editor({
   const [exportBusy, setExportBusy] = useState(false);
   const [cleanupProgress, setCleanupProgress] = useState<CleanupProgress | null>(null);
   const [cleanupError, setCleanupError] = useState('');
-  const [cleanupReview, setCleanupReview] = useState<{ snapshot: Segment[]; report: CleanupReport } | null>(null);
+  const [cleanupReview, setCleanupReview] = useState<{ snapshot: Segment[]; report: CleanupReport; assistant?: AssistantRequest['stage'] } | null>(null);
+  const [assistantMessages, setAssistantMessages] = useState<AssistantMessage[]>([]);
+  const [pendingCuts, setPendingCuts] = useState<Segment[] | null>(null);
   const [checkedCuts, setCheckedCuts] = useState<ReadonlySet<number>>(() => new Set());
   const [preview, setPreview] = useState(false);
   const [audition, setAudition] = useState<TimeRange | null>(null);
-  const cleanupJob = useRef<{ snapshot: Segment[]; controller: AbortController } | null>(null);
+  const cleanupJob = useRef<{ snapshot: Segment[]; controller: AbortController; assistant: boolean } | null>(null);
   const mediaRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -148,7 +151,10 @@ export function Editor({
   );
   const source = selectedId ? clipById.get(selectedId) : undefined;
   const sourceMarks = selectedId ? marks[selectedId] || {} : {};
-  const cleanupReport = cleanupReview?.snapshot === project.timeline ? cleanupReview.report : null;
+  const currentReview = cleanupReview?.snapshot === project.timeline && !!cleanupReview.assistant !== cleanupOpen
+    ? cleanupReview
+    : null;
+  const cleanupReport = currentReview?.report ?? null;
   const cleanupEdit = useMemo(() => {
     if (!cleanupReport) return null;
     return makeCleanupEdit(project.timeline, cleanupReport.proposals.flatMap((cut, index) =>
@@ -298,7 +304,7 @@ export function Editor({
     setCheckedCuts(new Set());
     setPreview(false);
     setAudition(null);
-    setCleanupError('The timeline changed. Run cleanup again to review suggestions.');
+    setCleanupError('The timeline changed. Run the analysis again to review suggestions.');
   }, [project.timeline, cleanupReview]);
 
   useEffect(() => {
@@ -542,23 +548,41 @@ export function Editor({
   }
 
   function closeCleanup() {
-    cleanupJob.current?.controller.abort();
-    resetCleanupPreview();
+    if (cleanupOpen) {
+      cleanupJob.current?.controller.abort();
+      resetCleanupPreview();
+      setCleanupError('');
+    }
     setCleanupOpen(false);
   }
 
-  async function runCleanup(options: Parameters<typeof analyzeTimeline>[3]) {
-    if (cleanupJob.current) return;
-    const job = { snapshot: project.timeline, controller: new AbortController() };
-    cleanupJob.current = job;
-    resetCleanupPreview();
-    setCleanupReview(null);
-    setCheckedCuts(new Set());
+  function leaveAssistant() {
+    if (cleanupJob.current?.assistant) cleanupJob.current.controller.abort();
+    if (!cleanupOpen) resetCleanupPreview();
     setCleanupError('');
-    setCleanupProgress({ stage: 'Preparing timeline cleanup', fraction: null });
+  }
+
+  async function runCleanup(options: CleanupOptions, snapshot = project.timeline) {
+    if (cleanupJob.current) return;
+    const stage = options.assistant?.stage;
+    const job = { snapshot, controller: new AbortController(), assistant: !!stage };
+    cleanupJob.current = job;
+    if (stage !== 'chat') {
+      if (snapshot === project.timeline) resetCleanupPreview();
+      setCleanupReview(null);
+      setCheckedCuts(new Set());
+    }
+    if (stage === 'cuts') setPendingCuts(snapshot);
+    if (stage === 'pauses') setPendingCuts(null);
+    setCleanupError('');
+    setCleanupProgress({ stage: stage ? 'Preparing the timeline assistant' : 'Preparing timeline cleanup', fraction: null });
     try {
       const report = await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
-      if (!job.controller.signal.aborted) setCleanupReview({ snapshot: job.snapshot, report });
+      if (job.controller.signal.aborted) return;
+      const turn = report.assistantTurn;
+      if (turn) setAssistantMessages((messages) => [...messages, ...turn]);
+      if (stage !== 'chat') setCleanupReview({ snapshot: job.snapshot, report, assistant: stage });
+      if (stage === 'cuts') setPendingCuts(null);
     } catch (error) {
       if (!job.controller.signal.aborted) setCleanupError(errorMessage(error, 'Could not analyze the timeline.'));
     } finally {
@@ -567,6 +591,15 @@ export function Editor({
         setCleanupProgress(null);
       }
     }
+  }
+
+  function runAssistant(request: AssistantRequest, snapshot = project.timeline) {
+    void runCleanup({ pauses: false, retakes: null, assistant: request }, snapshot);
+  }
+
+  function cancelCleanup() {
+    cleanupJob.current?.controller.abort();
+    setCleanupProgress({ stage: 'Stopping analysis…', fraction: null });
   }
 
   function playCleanupRange(range: TimeRange, edited: boolean) {
@@ -597,8 +630,8 @@ export function Editor({
     }
   }
 
-  function applyCleanup() {
-    if (!cleanupEdit || cleanupReview?.snapshot !== project.timeline) return;
+  function applyCleanup(nextAssistantStage?: AssistantRequest) {
+    if (!cleanupEdit || !currentReview || cleanupJob.current) return;
     const position = previewing ? sequenceTime : cleanupEdit.mapTime(sequenceTime);
     changeTimeline(cleanupEdit.timeline);
     setCleanupReview(null);
@@ -609,9 +642,37 @@ export function Editor({
     setMode('sequence');
     setSequenceTime(position);
     setPlaying(false);
-    setCleanupOpen(false);
+    if (!currentReview.assistant) setCleanupOpen(false);
+    if (nextAssistantStage) runAssistant(nextAssistantStage, cleanupEdit.timeline);
     setNotice('Timeline cleanup applied. Undo to restore the original sequence.');
   }
+
+  const cutReview = {
+    checked: checkedCuts,
+    saving: cleanupEdit?.secondsRemoved ?? 0,
+    invalidSelection: checkedCuts.size > 0 && !cleanupEdit,
+    previewing,
+    onToggle(index: number) {
+      resetCleanupPreview();
+      setCheckedCuts((checked) => {
+        const next = new Set(checked);
+        if (next.has(index)) next.delete(index);
+        else next.add(index);
+        return next;
+      });
+    },
+    onSelectPauses() {
+      resetCleanupPreview();
+      setCheckedCuts((checked) => new Set([
+        ...checked,
+        ...(cleanupReport?.proposals.flatMap((cut, index) => cut.kind === 'pause' ? [index] : []) ?? []),
+      ]));
+    },
+    onAudition: (range: TimeRange) => playCleanupRange(range, false),
+    onPreview: previewCleanup,
+    onApply: () => applyCleanup(),
+  };
+  const hasTimelineAudio = project.timeline.some((segment) => hasAnalyzableAudio(clipById.get(segment.clipId)));
   function jump(direction: -1 | 1) {
     const points =
       mode === 'sequence'
@@ -981,6 +1042,7 @@ export function Editor({
                 closeCleanup();
                 setAiOpen(true);
               } else {
+                if (aiOpen) leaveAssistant();
                 setAiOpen((value) => !value);
               }
             }}
@@ -994,6 +1056,7 @@ export function Editor({
             aria-expanded={exportOpen}
             onClick={() => {
               closeCleanup();
+              leaveAssistant();
               setAiOpen(false);
               setExportOpen(true);
               setPlaying(false);
@@ -1437,37 +1500,33 @@ export function Editor({
             progress={cleanupProgress}
             error={cleanupError}
             report={cleanupReport}
-            checked={checkedCuts}
-            saving={cleanupEdit?.secondsRemoved ?? 0}
-            invalidSelection={checkedCuts.size > 0 && !cleanupEdit}
-            hasAudio={project.timeline.some((segment) => hasAnalyzableAudio(clipById.get(segment.clipId)))}
-            previewing={previewing}
+            hasAudio={hasTimelineAudio}
             onClose={closeCleanup}
             onSettings={onSettings}
             onAnalyze={(options) => void runCleanup(options)}
-            onCancel={() => {
-              cleanupJob.current?.controller.abort();
-              setCleanupProgress({ stage: 'Stopping analysis…', fraction: null });
+            onCancel={cancelCleanup}
+            {...cutReview}
+          />
+        ) : aiOpen && desktop ? (
+          <AssistantPanel
+            projectId={project.id}
+            providerRevision={providerRevision}
+            hasAudio={hasTimelineAudio}
+            progress={cleanupProgress}
+            error={cleanupError}
+            report={cleanupReport}
+            reviewingPauses={currentReview?.assistant === 'pauses'}
+            needsCuts={pendingCuts === project.timeline}
+            messages={assistantMessages}
+            review={cutReview}
+            onRun={runAssistant}
+            onApplyPauses={applyCleanup}
+            onCancel={cancelCleanup}
+            onClose={() => {
+              leaveAssistant();
+              setAiOpen(false);
             }}
-            onToggle={(index) => {
-              resetCleanupPreview();
-              setCheckedCuts((checked) => {
-                const next = new Set(checked);
-                if (next.has(index)) next.delete(index);
-                else next.add(index);
-                return next;
-              });
-            }}
-            onSelectPauses={() => {
-              resetCleanupPreview();
-              setCheckedCuts((checked) => new Set([
-                ...checked,
-                ...(cleanupReport?.proposals.flatMap((cut, index) => cut.kind === 'pause' ? [index] : []) ?? []),
-              ]));
-            }}
-            onAudition={(range) => playCleanupRange(range, false)}
-            onPreview={previewCleanup}
-            onApply={applyCleanup}
+            onSettings={onSettings}
           />
         ) : aiOpen && (
           <aside className="ai-panel" aria-label="AI assistant">
@@ -1592,7 +1651,10 @@ export function Editor({
               <button type="button" className="button secondary cleanup-toggle" aria-expanded={cleanupOpen} disabled={exportBusy} onClick={() => {
                 setExportOpen(false);
                 if (cleanupOpen) closeCleanup();
-                else setCleanupOpen(true);
+                else {
+                  leaveAssistant();
+                  setCleanupOpen(true);
+                }
               }}>
                 <Icon name="sparkles" size={14} /> Clean up timeline
               </button>

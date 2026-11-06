@@ -6,12 +6,14 @@ const epsilon = 0.000001;
 
 export type TimeRange = { start: number; end: number };
 export type CleanupProposal = {
-  kind: 'pause' | 'retake';
+  kind: 'pause' | 'retake' | 'cut';
   remove: TimeRange;
   keep: TimeRange | null;
   removedText: string | null;
   keptText: string | null;
+  reason?: string;
 };
+export type AssistantMessage = { id: number; role: 'user' | 'assistant'; text: string };
 export type CleanupReport = {
   proposals: CleanupProposal[];
   retakeIssue: string | null;
@@ -19,6 +21,7 @@ export type CleanupReport = {
   failedSources: number;
   speech?: SpeechSelection | null;
   runtimeNotice?: string | null;
+  assistantTurn?: AssistantMessage[];
 };
 
 export function makeCleanupEdit(timeline: Segment[], ranges: TimeRange[]) {

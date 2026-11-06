@@ -1,0 +1,216 @@
+name: Desktop installers
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the current version from main
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image || '' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian x64
+            runner: ubuntu-22.04
+            bundle: deb
+            extension: deb
+          - name: Enterprise Linux 10 x64
+            runner: ubuntu-24.04
+            image: rockylinux/rockylinux:10
+            bundle: rpm
+            extension: rpm
+          - name: Windows x64
+            runner: windows-2025
+            bundle: nsis
+            extension: exe
+          - name: macOS Universal
+            runner: macos-15
+            target: universal-apple-darwin
+            bundle: dmg
+            extension: dmg
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Install Enterprise Linux dependencies
+        if: matrix.bundle == 'rpm'
+        run: |
+          dnf -y install epel-release
+          if ! command -v curl >/dev/null; then
+            dnf -y install curl-minimal
+          fi
+          dnf -y --enablerepo=crb install \
+            git ca-certificates tar gzip xz unzip file python3 \
+            gcc-c++ make cmake clang clang-devel dbus-devel openssl-devel \
+            pkgconf-pkg-config webkit2gtk4.1-devel librsvg2-devel rpm-build
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Debian build dependencies
+        if: matrix.bundle == 'deb'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libclang-dev libdbus-1-dev \
+            libssl-dev libwebkit2gtk-4.1-dev librsvg2-dev pkg-config
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: '1.4.3'
+
+      - name: Set up Rust
+        run: |
+          if command -v rustup >/dev/null; then
+            rustup toolchain install stable --profile minimal --no-self-update
+            rustup default stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install both macOS Rust targets
+        if: matrix.bundle == 'dmg'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Use runner's LLVM on Windows
+        if: matrix.bundle == 'nsis'
+        run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+
+      - run: bun install --frozen-lockfile
+      - run: bun run test
+
+      - name: Build installer
+        env:
+          BUNDLE: ${{ matrix.bundle }}
+          RUST_TARGET: ${{ matrix.target }}
+          PYTHON: ${{ runner.os == 'Windows' && 'python' || 'python3' }}
+          APPLE_CERTIFICATE: ${{ matrix.bundle == 'dmg' && github.ref == 'refs/heads/main' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.bundle == 'dmg' && github.ref == 'refs/heads/main' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_ID: ${{ matrix.bundle == 'dmg' && github.ref == 'refs/heads/main' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ matrix.bundle == 'dmg' && github.ref == 'refs/heads/main' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.bundle == 'dmg' && github.ref == 'refs/heads/main' && secrets.APPLE_TEAM_ID || '' }}
+        run: |
+          args=(--backend cpu --bundles "$BUNDLE" --locked)
+          if [[ "$BUNDLE" == dmg ]]; then
+            args+=(--target "$RUST_TARGET")
+            if [[ -n "$APPLE_CERTIFICATE$APPLE_CERTIFICATE_PASSWORD$APPLE_ID$APPLE_PASSWORD$APPLE_TEAM_ID" ]]; then
+              : "${APPLE_CERTIFICATE:?Set the Apple signing certificate}"
+              : "${APPLE_CERTIFICATE_PASSWORD:?Set the Apple certificate password}"
+              : "${APPLE_ID:?Set the Apple ID for notarization}"
+              : "${APPLE_PASSWORD:?Set the Apple app-specific password}"
+              : "${APPLE_TEAM_ID:?Set the Apple Developer team ID}"
+            else
+              unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+              export APPLE_SIGNING_IDENTITY=-
+            fi
+          fi
+          "$PYTHON" scripts/build-speech.py "${args[@]}"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: cutline-${{ matrix.bundle }}
+          path: src-tauri/target/speech-portable-cpu/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/bundle/${{ matrix.bundle }}/*.${{ matrix.extension }}
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  version:
+    name: Check release version
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.publish_release)
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          config=src-tauri/tauri.conf.json
+          version=$(jq -er '.version' "$config")
+          if [[ "$GITHUB_EVENT_NAME" == push && ! "$BEFORE" =~ ^0+$ ]]; then
+            previous=$(git show "${BEFORE}:$config" | jq -er '.version')
+            if [[ "$version" == "$previous" ]]; then
+              exit 0
+            fi
+          fi
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Desktop releases require a version in major.minor.patch form"
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish GitHub release
+    needs: [build, version]
+    if: needs.version.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: cutline-release-${{ needs.version.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          path: installers
+          pattern: cutline-*
+          merge-multiple: true
+      - name: Publish all four installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          shopt -s failglob
+          assets=(installers/*.deb installers/*.rpm installers/*.exe installers/*.dmg)
+          tag_commit=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" || true)
+          if [[ -n "$tag_commit" && "$tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::Tag $TAG belongs to a different commit. Bump the version."
+            exit 1
+          fi
+          if release=$(gh release view "$TAG" --json isDraft,targetCommitish); then
+            if [[ "$(jq -r .isDraft <<< "$release")" == false && "$tag_commit" == "$GITHUB_SHA" ]]; then
+              echo "Release $TAG is already published."
+              exit 0
+            fi
+            if [[ "$(jq -r .isDraft <<< "$release")" != true || "$(jq -r .targetCommitish <<< "$release")" != "$GITHUB_SHA" ]]; then
+              echo "::error::Release $TAG already exists for another target."
+              exit 1
+            fi
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --draft=false
+          else
+            gh release create "$TAG" "${assets[@]}" --target "$GITHUB_SHA" \
+              --title "Cutline $TAG" --generate-notes
+          fi

@@ -6,7 +6,7 @@ use std::{
     sync::Mutex,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -140,18 +140,61 @@ pub(crate) fn store_transcript(
     store_project_transcript(&cache_path(app)?, project_id, transcript)
 }
 
+pub(crate) fn read_transcript<T: DeserializeOwned>(
+    app: &AppHandle,
+    project_id: &str,
+) -> Result<Option<T>, String> {
+    with_project_cache(app, project_id, |folder| {
+        match File::open(transcript_path(folder, project_id)) {
+            Ok(file) => serde_json::from_reader(BufReader::new(file))
+                .map(Some)
+                .map_err(|err| err.to_string()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    })
+}
+
+pub(crate) fn with_project_cache<T>(
+    app: &AppHandle,
+    project_id: &str,
+    operation: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let cache = app.state::<ProjectCache>();
+    let _guard = cache.io.lock().unwrap();
+    operation(project_workspace(&cache_path(app)?, project_id)?)
+}
+
+fn transcript_path(workspace: &Path, project_id: &str) -> PathBuf {
+    workspace
+        .join("transcripts")
+        .join(format!("project-{project_id}.json"))
+}
+
 fn store_project_transcript(
     projects_path: &Path,
     project_id: &str,
     transcript: &impl Serialize,
 ) -> Result<(), String> {
+    let workspace = project_workspace(projects_path, project_id)?;
+    let folder = workspace.join("transcripts");
+    // An in-flight analysis must never recreate a deleted workspace.
+    if let Err(error) = fs::create_dir(&folder)
+        && error.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(error.to_string());
+    }
+    write_json(&transcript_path(workspace, project_id), transcript, true)
+}
+
+fn project_workspace<'a>(projects_path: &'a Path, project_id: &str) -> Result<&'a Path, String> {
     if project_id.is_empty()
         || project_id.len() > 128
         || !project_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     {
-        return Err("Invalid project ID for transcript storage.".into());
+        return Err("Invalid project ID for cache storage.".into());
     }
     let snapshot = load(projects_path)?.ok_or("The workspace cache was cleared.")?;
     if !snapshot
@@ -161,21 +204,9 @@ fn store_project_transcript(
     {
         return Err("The project is unavailable in the workspace cache.".into());
     }
-    let folder = projects_path
+    projects_path
         .parent()
-        .ok_or("Invalid project cache path.")?
-        .join("transcripts");
-    // An in-flight analysis must never recreate a deleted workspace.
-    if let Err(error) = fs::create_dir(&folder)
-        && error.kind() != io::ErrorKind::AlreadyExists
-    {
-        return Err(error.to_string());
-    }
-    write_json(
-        &folder.join(format!("project-{project_id}.json")),
-        transcript,
-        true,
-    )
+        .ok_or_else(|| "Invalid project cache path.".into())
 }
 
 fn save_current(

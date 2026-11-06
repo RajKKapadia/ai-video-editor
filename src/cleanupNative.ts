@@ -22,7 +22,9 @@ export type ProviderStatus = {
 export type ProviderSelection = { provider: Provider; config: ProviderConfig };
 
 export type CleanupProgress = { stage: string; fraction: number | null };
-type Options = { pauses: boolean; retakes: ProviderSelection | null };
+export type AssistantStage = 'pauses' | 'cuts' | 'chat';
+export type AssistantRequest = { stage: AssistantStage; message: string; provider: ProviderSelection };
+export type CleanupOptions = { pauses: boolean; retakes: ProviderSelection | null; assistant?: AssistantRequest };
 
 const chunkBytes = 1024 * 1024;
 
@@ -38,7 +40,7 @@ export async function analyzeTimeline(
   projectId: string,
   timeline: Segment[],
   clips: ReadonlyMap<string, Clip>,
-  options: Options,
+  options: CleanupOptions,
   signal: AbortSignal,
   update: (progress: CleanupProgress) => void,
 ) {
@@ -53,7 +55,9 @@ export async function analyzeTimeline(
     if (signal.aborted) cancel();
     else update({
       ...payload,
-      stage: payload.stage === 'Analyzing speech' && currentSource ? payload.stage + ' · ' + currentSource : payload.stage,
+      stage: currentSource && ['Analyzing speech', 'Transcribing the reviewed timeline'].includes(payload.stage)
+        ? payload.stage + ' · ' + currentSource
+        : payload.stage,
     });
   });
   let complete = false;

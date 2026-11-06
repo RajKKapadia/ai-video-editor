@@ -181,14 +181,7 @@ impl Engine {
         if !status.is_ok_and(|status| status.success()) || detected.duration <= 0.0 {
             return Err("No readable audio was found in this timeline range.".into());
         }
-        let mut result = Analysis {
-            pauses: if pauses {
-                detected.pauses()
-            } else {
-                Vec::new()
-            },
-            ..Default::default()
-        };
+        let mut result = Analysis::default();
         if let (Some(whisper), Some(pcm)) = (&self.whisper, pcm) {
             let pcm = pcm
                 .into_inner()
@@ -211,6 +204,9 @@ impl Engine {
             progress(1.0);
         }
         control.check()?;
+        if pauses {
+            result.pauses = detected.pauses();
+        }
         Ok(result)
     }
 
