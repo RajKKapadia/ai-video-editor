@@ -1,0 +1,973 @@
+mod audio;
+mod models;
+pub(crate) mod providers;
+pub(crate) mod speech;
+pub(crate) mod worker;
+
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+use tauri::{
+    AppHandle, Emitter, Manager, State,
+    ipc::{InvokeBody, Request},
+};
+use tempfile::NamedTempFile;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::project_cache::{MediaInput, approved_media, store_transcript};
+
+use audio::{Analysis, Control, Engine};
+use providers::{Config, Connection, Provider, Retake, UtteranceRange};
+
+const CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const TRANSCRIPT_LIMIT: usize = 48 * 1024;
+const TRANSCRIPT_TOO_LARGE: &str =
+    "The timeline transcript exceeds 48 KiB. Use a shorter sequence for retake analysis.";
+
+pub(crate) struct CleanupJobs {
+    active: Mutex<Option<Arc<Session>>>,
+    worker: Arc<Semaphore>,
+}
+
+impl Default for CleanupJobs {
+    fn default() -> Self {
+        Self {
+            active: Mutex::new(None),
+            worker: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
+impl CleanupJobs {
+    fn get(&self, id: &str) -> Result<Arc<Session>, String> {
+        self.active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|job| job.id == id)
+            .cloned()
+            .ok_or_else(|| "This timeline analysis is no longer active.".into())
+    }
+
+    fn take(&self, id: Option<&str>) -> Option<Arc<Session>> {
+        let mut slot = self.active.lock().unwrap();
+        if id.is_none_or(|id| slot.as_ref().is_some_and(|job| job.id == id)) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn cancel_active(&self) {
+        if let Some(job) = self.take(None) {
+            job.control.stop();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct Range {
+    start: f64,
+    end: f64,
+}
+
+impl Range {
+    fn new(start: f64, end: f64) -> Self {
+        Self { start, end }
+    }
+
+    fn duration(self) -> f64 {
+        self.end - self.start
+    }
+
+    fn offset(self, offset: f64) -> Self {
+        Self::new(self.start + offset, self.end + offset)
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TimelineSegment {
+    clip_id: String,
+    #[serde(rename = "in")]
+    start: f64,
+    out: f64,
+    analyze: bool,
+}
+
+#[derive(Clone)]
+struct Run {
+    clip_id: String,
+    source: Range,
+    timeline_start: f64,
+    analyze: bool,
+}
+
+fn timeline_runs(segments: Vec<TimelineSegment>) -> Result<Vec<Run>, String> {
+    if segments.is_empty() || segments.len() > 20_000 {
+        return Err("Add footage to the timeline or use a smaller sequence for cleanup.".into());
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut cursor = 0.0;
+    for segment in segments {
+        if segment.clip_id.is_empty()
+            || segment.clip_id.len() > 128
+            || !segment.start.is_finite()
+            || !segment.out.is_finite()
+            || segment.start < 0.0
+            || segment.out > 86_400.0
+            || segment.out <= segment.start
+        {
+            return Err("The timeline contains a source range that cannot be analyzed.".into());
+        }
+        let source = Range::new(segment.start, segment.out);
+        if let Some(previous) = runs.last_mut().filter(|previous| {
+            previous.clip_id == segment.clip_id
+                && previous.analyze == segment.analyze
+                && (previous.source.end - source.start).abs() < 0.000_001
+        }) {
+            previous.source.end = source.end;
+        } else {
+            runs.push(Run {
+                clip_id: segment.clip_id,
+                source,
+                timeline_start: cursor,
+                analyze: segment.analyze,
+            });
+        }
+        cursor += source.duration();
+    }
+    Ok(runs)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ProviderSelection {
+    provider: Provider,
+    config: Config,
+}
+
+struct Upload {
+    clip_id: String,
+    file: NamedTempFile,
+    remaining: u64,
+}
+
+#[derive(Default)]
+struct Data {
+    vad: Option<PathBuf>,
+    whisper: Option<PathBuf>,
+    speech: Option<speech::Selection>,
+    runtime_notice: Option<String>,
+    connection: Option<Connection>,
+    retake_issue: Option<String>,
+    upload: Option<Upload>,
+    pending: HashSet<String>,
+    failed: HashSet<String>,
+    results: Vec<Option<Arc<Analysis>>>,
+    working: bool,
+    text_bytes: usize,
+}
+
+struct Session {
+    id: String,
+    project_id: Option<String>,
+    runs: Vec<Run>,
+    pauses: bool,
+    decoder: PathBuf,
+    control: Control,
+    data: Mutex<Data>,
+    _lease: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Progress<'a> {
+    id: &'a str,
+    stage: &'a str,
+    fraction: Option<f64>,
+}
+
+fn progress(app: &AppHandle, id: &str, stage: &str, fraction: Option<f64>) {
+    let _ = app.emit_to(
+        "main",
+        "timeline-cleanup-progress",
+        Progress {
+            id,
+            stage,
+            fraction,
+        },
+    );
+}
+
+#[tauri::command]
+pub(crate) async fn cleanup_begin(
+    app: AppHandle,
+    id: String,
+    project_id: Option<String>,
+    segments: Vec<TimelineSegment>,
+    pauses: bool,
+    retakes: Option<ProviderSelection>,
+) -> Result<Vec<String>, String> {
+    if id.len() != 36 || !pauses && retakes.is_none() {
+        return Err("Choose a timeline cleanup option.".into());
+    }
+    let runs = timeline_runs(segments)?;
+    let mut pending = HashSet::new();
+    let sources: Vec<_> = runs
+        .iter()
+        .filter(|run| run.analyze && pending.insert(run.clip_id.clone()))
+        .map(|run| run.clip_id.clone())
+        .collect();
+    if sources.is_empty() {
+        return Err("Add footage with an audio track to analyze the timeline.".into());
+    }
+    let jobs = app.state::<CleanupJobs>();
+    let lease = jobs
+        .worker
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "A timeline analysis is already running or stopping.")?;
+    let results = vec![None; runs.len()];
+    let session = Arc::new(Session {
+        id: id.clone(),
+        project_id,
+        runs,
+        pauses,
+        decoder: audio::find_ffmpeg()?,
+        control: Control::default(),
+        data: Mutex::new(Data {
+            pending,
+            results,
+            ..Default::default()
+        }),
+        _lease: lease,
+    });
+    *jobs.active.lock().unwrap() = Some(session.clone());
+    let result = setup(&app, &session, retakes).await;
+    if result.is_err() {
+        jobs.take(Some(&id));
+    }
+    result.map(|()| sources)
+}
+
+async fn setup(
+    app: &AppHandle,
+    session: &Session,
+    retakes: Option<ProviderSelection>,
+) -> Result<(), String> {
+    let cancel = &session.control.cancel;
+    let mut retake_issue = None;
+    let mut connection = if let Some(selection) = retakes {
+        match providers::connection(app.clone(), selection.provider, selection.config).await {
+            Ok(connection) => Some(connection),
+            Err(error) if session.pauses => {
+                retake_issue = Some(error);
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    progress(app, &session.id, "Preparing voice detection", None);
+    let vad = models::install(app, &models::VAD, cancel, |bytes, total| {
+        progress(
+            app,
+            &session.id,
+            "Downloading voice detector",
+            total.map(|total| bytes as f64 / total as f64),
+        );
+    })
+    .await?;
+    let mut speech_selection = None;
+    let whisper = if connection.is_some() {
+        progress(app, &session.id, "Preparing local transcription", None);
+        match speech::prepare(app, &session.control, |stage, fraction| {
+            progress(app, &session.id, stage, fraction)
+        })
+        .await
+        {
+            Ok((path, selection)) => {
+                speech_selection = Some(selection);
+                Some(path)
+            }
+            Err(error) if session.pauses && !cancel.is_cancelled() => {
+                retake_issue = Some(error);
+                connection = None;
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    session.control.check()?;
+    let mut data = session.data.lock().unwrap();
+    data.vad = Some(vad);
+    data.whisper = whisper;
+    data.speech = speech_selection;
+    data.connection = connection;
+    data.retake_issue = retake_issue;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn cleanup_source_begin(
+    state: State<'_, CleanupJobs>,
+    id: String,
+    clip_id: String,
+    bytes: u64,
+) -> Result<(), String> {
+    let session = state.get(&id)?;
+    let mut data = session.data.lock().unwrap();
+    if data.vad.is_none()
+        || data.working
+        || data.upload.is_some()
+        || !data.pending.contains(&clip_id)
+    {
+        return Err("This timeline source is not ready for analysis.".into());
+    }
+    if bytes == 0 || bytes > MAX_SOURCE_BYTES {
+        return Err("This source is empty or too large for timeline cleanup.".into());
+    }
+    let file =
+        NamedTempFile::new().map_err(|_| "Could not create timeline analysis scratch space.")?;
+    data.upload = Some(Upload {
+        clip_id,
+        file,
+        remaining: bytes,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn cleanup_source_push(
+    state: State<'_, CleanupJobs>,
+    request: Request<'_>,
+) -> Result<(), String> {
+    let id = request
+        .headers()
+        .get("x-cleanup-id")
+        .and_then(|header| header.to_str().ok())
+        .ok_or("Missing analysis job ID.")?;
+    let session = state.get(id)?;
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Expected a binary media chunk.".into());
+    };
+    let mut data = session.data.lock().unwrap();
+    let upload = data
+        .upload
+        .as_mut()
+        .ok_or("No timeline source is being transferred.")?;
+    if bytes.is_empty() || bytes.len() > CHUNK_BYTES || bytes.len() as u64 > upload.remaining {
+        return Err("Invalid timeline media chunk.".into());
+    }
+    upload
+        .file
+        .write_all(bytes)
+        .map_err(|_| "Could not stage source media. Check free disk space.")?;
+    upload.remaining -= bytes.len() as u64;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn cleanup_source_skip(
+    state: State<'_, CleanupJobs>,
+    id: String,
+    clip_id: String,
+) -> Result<(), String> {
+    let session = state.get(&id)?;
+    skip_source(&session, clip_id)
+}
+
+fn skip_source(session: &Session, clip_id: String) -> Result<(), String> {
+    let mut data = session.data.lock().unwrap();
+    if data.vad.is_none() || data.upload.is_some() || data.working || !data.pending.remove(&clip_id)
+    {
+        return Err("This timeline source is not ready for analysis.".into());
+    }
+    data.failed.insert(clip_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn cleanup_source_finish(
+    app: AppHandle,
+    id: String,
+    original: Option<OriginalSource>,
+) -> Result<(), String> {
+    let session = app.state::<CleanupJobs>().get(&id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let linked = if let Some(original) = original {
+            let Some((path, _)) = approved_media(&app, &original.file_path) else {
+                return skip_source(&session, original.clip_id);
+            };
+            Some((original.clip_id, MediaInput::Original(path)))
+        } else {
+            None
+        };
+        analyze_source(&app, &session, linked)
+    })
+    .await
+    .map_err(|_| "Local audio analysis stopped unexpectedly.")?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OriginalSource {
+    clip_id: String,
+    file_path: PathBuf,
+}
+
+fn analyze_source(
+    app: &AppHandle,
+    session: &Session,
+    linked: Option<(String, MediaInput)>,
+) -> Result<(), String> {
+    let (clip_id, input, vad, whisper, selection, mut text_bytes) = {
+        let mut data = session.data.lock().unwrap();
+        let vad = data.vad.clone().ok_or("Voice detection is not ready.")?;
+        if data.working {
+            return Err("Another timeline source is being analyzed.".into());
+        }
+        let (clip_id, input) = match linked {
+            Some((clip_id, input)) if data.upload.is_none() && data.pending.contains(&clip_id) => {
+                (clip_id, input)
+            }
+            Some(_) => return Err("This timeline source is not ready for analysis.".into()),
+            None => {
+                if data
+                    .upload
+                    .as_ref()
+                    .is_none_or(|upload| upload.remaining != 0)
+                {
+                    return Err("The timeline source transfer is incomplete.".into());
+                }
+                let upload = data.upload.take().unwrap();
+                (upload.clip_id, MediaInput::Scratch(upload.file))
+            }
+        };
+        data.working = true;
+        (
+            clip_id,
+            input,
+            vad,
+            data.whisper.clone(),
+            data.speech.clone(),
+            data.text_bytes,
+        )
+    };
+    let mut engine = Engine::new(&vad)?;
+    if let Some(selection) = &selection {
+        engine.device = selection.device_id();
+        engine.threads = selection.threads;
+    }
+    let mut runtime_notice = None;
+    let mut retake_issue = whisper
+        .as_deref()
+        .and_then(|path| engine.load_whisper(path).err());
+    let mut failed = false;
+    let mut results: Vec<(usize, Option<Arc<Analysis>>)> = Vec::new();
+    let mut cache: HashMap<(u64, u64), Option<Arc<Analysis>>> = HashMap::new();
+    let work: Vec<_> = session
+        .runs
+        .iter()
+        .enumerate()
+        .filter(|(_, run)| run.analyze && run.clip_id == clip_id)
+        .collect();
+    for (done, (index, run)) in work.iter().enumerate() {
+        session.control.check()?;
+        let key = (run.source.start.to_bits(), run.source.end.to_bits());
+        let result = if let Some(result) = cache.get(&key) {
+            result.clone()
+        } else {
+            let report = |fraction| {
+                progress(
+                    app,
+                    &session.id,
+                    "Analyzing speech",
+                    Some((done as f64 + fraction) / work.len() as f64),
+                )
+            };
+            report(0.0);
+            let result = match engine.analyze(
+                &session.decoder,
+                input.path(),
+                run.source,
+                session.pauses,
+                &session.control,
+                report,
+            ) {
+                Ok(mut result) => {
+                    if let Some(notice) = result.runtime_notice.take() {
+                        runtime_notice = Some(notice);
+                        engine.device = None;
+                    }
+                    if let Some(issue) = result.transcript_issue.take() {
+                        retake_issue.get_or_insert(issue);
+                    }
+                    Some(Arc::new(result))
+                }
+                Err(_) if !session.control.cancel.is_cancelled() => {
+                    failed = true;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            cache.insert(key, result.clone());
+            result
+        };
+        if let Some(result) = &result {
+            text_bytes += result
+                .utterances
+                .iter()
+                .map(|utterance| utterance.text.len())
+                .sum::<usize>();
+            if text_bytes > TRANSCRIPT_LIMIT {
+                retake_issue.get_or_insert_with(|| TRANSCRIPT_TOO_LARGE.into());
+            }
+        }
+        if retake_issue.is_some() {
+            engine.stop_transcription();
+        }
+        results.push((*index, result));
+    }
+    drop(input);
+    session.control.check()?;
+    if runtime_notice.is_some()
+        && let Some(selection) = &selection
+        && speech::record_gpu_failure(app, selection).is_err()
+    {
+        runtime_notice
+            .as_mut()
+            .unwrap()
+            .push_str(" Could not save the backend fallback for future jobs.");
+    }
+    let mut data = session.data.lock().unwrap();
+    data.working = false;
+    if let Some(notice) = runtime_notice {
+        data.runtime_notice = Some(notice.clone());
+        if let Some(selection) = data.speech.as_mut() {
+            selection.device = None;
+            selection.benchmark = None;
+            selection.reason.push_str(&format!(" {notice}"));
+        }
+    }
+    data.pending.remove(&clip_id);
+    if failed {
+        data.failed.insert(clip_id);
+    }
+    if retake_issue.is_some() {
+        data.retake_issue = retake_issue;
+        data.whisper = None;
+        data.connection = None;
+    }
+    data.text_bytes = text_bytes;
+    for (index, result) in results {
+        data.results[index] = result;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Proposal {
+    kind: &'static str,
+    remove: Range,
+    keep: Option<Range>,
+    removed_text: Option<String>,
+    kept_text: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Report {
+    proposals: Vec<Proposal>,
+    retake_issue: Option<String>,
+    transcript_cache_issue: Option<String>,
+    failed_sources: usize,
+    speech: Option<speech::Selection>,
+    runtime_notice: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedTranscript {
+    model: String,
+    engine: &'static str,
+    processing_device: String,
+    generated_at_ms: u64,
+    failed_sources: usize,
+    transcription_issue: Option<String>,
+    utterances: Vec<CachedUtterance>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedUtterance {
+    clip_id: String,
+    timeline: Range,
+    source: Range,
+    text: String,
+}
+
+#[tauri::command]
+pub(crate) async fn cleanup_finish(app: AppHandle, id: String) -> Result<Report, String> {
+    let jobs = app.state::<CleanupJobs>();
+    let session = jobs.get(&id)?;
+    let (results, connection, issue, failed) = {
+        let mut data = session.data.lock().unwrap();
+        if data.working || data.vad.is_none() || data.upload.is_some() || !data.pending.is_empty() {
+            return Err("Local timeline analysis is still in progress.".into());
+        }
+        data.working = true;
+        (
+            std::mem::take(&mut data.results),
+            data.connection.take(),
+            data.retake_issue.take(),
+            data.failed.len(),
+        )
+    };
+    let result = proposals(&app, &session, results, connection, issue, failed).await;
+    jobs.take(Some(&id));
+    result
+}
+
+async fn proposals(
+    app: &AppHandle,
+    session: &Session,
+    results: Vec<Option<Arc<Analysis>>>,
+    connection: Option<Connection>,
+    retake_issue: Option<String>,
+    failed_sources: usize,
+) -> Result<Report, String> {
+    let (speech, runtime_notice) = {
+        let data = session.data.lock().unwrap();
+        (data.speech.clone(), data.runtime_notice.clone())
+    };
+    let mut report = Report {
+        proposals: Vec::new(),
+        retake_issue,
+        transcript_cache_issue: None,
+        failed_sources,
+        speech,
+        runtime_notice,
+    };
+    for (run, result) in session.runs.iter().zip(&results) {
+        if let Some(result) = result {
+            report
+                .proposals
+                .extend(result.pauses.iter().map(|range| Proposal {
+                    kind: "pause",
+                    remove: range.offset(run.timeline_start),
+                    keep: None,
+                    removed_text: None,
+                    kept_text: None,
+                }));
+        }
+    }
+    session.control.check()?;
+    let utterances = ordered_utterances(&session.runs, &results);
+    if let Some(project_id) = &session.project_id
+        && !utterances.is_empty()
+    {
+        let transcript = CachedTranscript {
+            model: report
+                .speech
+                .as_ref()
+                .map(|selection| selection.model.file().name.to_owned())
+                .unwrap_or_else(|| "unknown".into()),
+            engine: whisper_rs::WHISPER_CPP_VERSION,
+            processing_device: report
+                .speech
+                .as_ref()
+                .and_then(|selection| selection.device.as_ref())
+                .map(|device| device.name.clone())
+                .unwrap_or_else(|| "CPU".into()),
+            generated_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            failed_sources,
+            transcription_issue: report.retake_issue.clone(),
+            utterances: utterances
+                .iter()
+                .map(|line| {
+                    let run = &session.runs[line.run];
+                    CachedUtterance {
+                        clip_id: run.clip_id.clone(),
+                        timeline: line.speech,
+                        source: line.speech.offset(run.source.start - run.timeline_start),
+                        text: line.text.to_owned(),
+                    }
+                })
+                .collect(),
+        };
+        let app = app.clone();
+        let project_id = project_id.clone();
+        let cancel = session.control.cancel.clone();
+        let saved = tauri::async_runtime::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            store_transcript(&app, &project_id, &transcript)
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            report.transcript_cache_issue =
+                Some("Could not save the transcript in the workspace cache.".into());
+        }
+    }
+    session.control.check()?;
+    if let Some(connection) = connection
+        && utterances.len() >= 2
+    {
+        progress(
+            app,
+            &session.id,
+            "Comparing repeated takes with your provider",
+            None,
+        );
+        match retake_proposals(&connection, &utterances, &session.control.cancel).await {
+            Ok(proposals) => report.proposals.extend(proposals),
+            Err(error) => report.retake_issue = Some(error),
+        }
+    }
+    session.control.check()?;
+    report
+        .proposals
+        .sort_by(|left, right| left.remove.start.total_cmp(&right.remove.start));
+    Ok(report)
+}
+
+async fn retake_proposals(
+    connection: &Connection,
+    utterances: &[TimelineUtterance<'_>],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<Proposal>, String> {
+    let transcript = serde_json::to_string(
+        &utterances
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index + 1, item.text))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| "Could not prepare the local transcript.")?;
+    let retakes = connection.analyze(&transcript, cancel).await?;
+    Ok(safe_retakes(retakes, utterances))
+}
+
+struct TimelineUtterance<'a> {
+    run: usize,
+    ordinal: usize,
+    last: bool,
+    speech: Range,
+    cut_start: Option<f64>,
+    cut_end: Option<f64>,
+    text: &'a str,
+}
+
+fn ordered_utterances<'a>(
+    runs: &[Run],
+    results: &'a [Option<Arc<Analysis>>],
+) -> Vec<TimelineUtterance<'a>> {
+    runs.iter()
+        .zip(results)
+        .enumerate()
+        .flat_map(|(index, (run, result))| {
+            result
+                .iter()
+                .flat_map(|result| &result.utterances)
+                .map(move |utterance| TimelineUtterance {
+                    run: index,
+                    ordinal: utterance.ordinal,
+                    last: utterance.last,
+                    speech: utterance.speech.offset(run.timeline_start),
+                    cut_start: utterance.start.map(|time| run.timeline_start + time),
+                    cut_end: utterance.end.map(|time| run.timeline_start + time),
+                    text: &utterance.text,
+                })
+        })
+        .collect()
+}
+
+fn resolve<'a, 'b>(
+    range: UtteranceRange,
+    utterances: &'b [TimelineUtterance<'a>],
+) -> Option<&'b [TimelineUtterance<'a>]> {
+    if range.first == 0 || range.last < range.first {
+        return None;
+    }
+    let items = utterances.get((range.first - 1) as usize..range.last as usize)?;
+    // Gaps in these ordinals mark untranscribed speech or a protected range.
+    items
+        .windows(2)
+        .all(|pair| {
+            let [left, right] = [&pair[0], &pair[1]];
+            if left.run == right.run {
+                right.ordinal == left.ordinal + 1 && right.speech.start - left.speech.end <= 2.0
+            } else {
+                right.run == left.run + 1
+                    && left.last
+                    && right.ordinal == 0
+                    && left
+                        .cut_end
+                        .zip(right.cut_start)
+                        .is_some_and(|(end, start)| (start - end).abs() <= 0.45)
+            }
+        })
+        .then_some(items)
+}
+
+fn safe_retakes(retakes: Vec<Retake>, utterances: &[TimelineUtterance<'_>]) -> Vec<Proposal> {
+    let mut unique = Vec::new();
+    let resolved: Vec<_> = retakes
+        .into_iter()
+        .filter(|retake| {
+            if unique.contains(retake) {
+                return false;
+            }
+            unique.push(*retake);
+            true
+        })
+        .filter_map(|retake| {
+            let keep = resolve(retake.keep, utterances)?;
+            let remove = resolve(retake.remove, utterances)?;
+            let keep_range = Range::new(keep.first()?.speech.start, keep.last()?.speech.end);
+            let remove_range = Range::new(remove.first()?.cut_start?, remove.last()?.cut_end?);
+            if remove_range.duration() <= 0.0
+                || remove_range.overlaps(keep_range)
+                || utterances.iter().enumerate().any(|(index, item)| {
+                    let id = index as u32 + 1;
+                    (id < retake.remove.first || id > retake.remove.last)
+                        && remove_range.overlaps(item.speech)
+                })
+            {
+                return None;
+            }
+            Some((keep, remove, keep_range, remove_range))
+        })
+        .collect();
+    resolved
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (keep, remove, keep_range, remove_range))| {
+            let conflict =
+                resolved
+                    .iter()
+                    .enumerate()
+                    .any(|(other, (_, _, other_keep, other_remove))| {
+                        other != index
+                            && (remove_range.overlaps(*other_remove)
+                                || remove_range.overlaps(*other_keep)
+                                || other_remove.overlaps(*keep_range))
+                    });
+            (!conflict).then(|| Proposal {
+                kind: "retake",
+                remove: *remove_range,
+                keep: Some(*keep_range),
+                removed_text: Some(join_text(remove)),
+                kept_text: Some(join_text(keep)),
+            })
+        })
+        .collect()
+}
+
+fn join_text(items: &[TimelineUtterance<'_>]) -> String {
+    items
+        .iter()
+        .map(|item| item.text)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[tauri::command]
+pub(crate) fn cleanup_cancel(state: State<'_, CleanupJobs>, id: String) {
+    if let Some(session) = state.take(Some(&id)) {
+        session.control.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projects_reused_and_trimmed_sources_into_timeline_order() {
+        let segment = |clip_id: &str, start, out, analyze| TimelineSegment {
+            clip_id: clip_id.into(),
+            start,
+            out,
+            analyze,
+        };
+        let runs = timeline_runs(vec![
+            segment("a", 12.0, 14.0, true),
+            segment("a", 14.0, 16.0, true),
+            segment("b", 0.0, 3.0, false),
+            segment("a", 12.0, 14.0, true),
+        ])
+        .unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].source, Range::new(12.0, 16.0));
+        assert_eq!(runs[2].timeline_start, 7.0);
+        let result = Arc::new(Analysis {
+            utterances: vec![audio::Utterance {
+                speech: Range::new(0.5, 1.0),
+                start: Some(0.4),
+                end: Some(1.1),
+                ordinal: 0,
+                last: true,
+                text: "An example".into(),
+            }],
+            ..Default::default()
+        });
+        let results = [Some(result.clone()), None, Some(result)];
+        let ordered = ordered_utterances(&runs, &results);
+        assert_eq!(ordered[0].speech.start, 0.5);
+        assert_eq!(ordered[1].speech.start, 7.5);
+        assert!(resolve(UtteranceRange { first: 1, last: 2 }, &ordered).is_none());
+    }
+
+    #[test]
+    fn resolves_distant_retakes_and_drops_conflicting_or_unsafe_cuts() {
+        let line = |run, time, safe: bool| TimelineUtterance {
+            run,
+            ordinal: 0,
+            last: true,
+            speech: Range::new(time + 0.2, time + 0.8),
+            cut_start: safe.then_some(time + 0.1),
+            cut_end: Some(time + 0.9),
+            text: "Speech",
+        };
+        let lines = [
+            line(0, 0.0, true),
+            line(1, 5.0, false),
+            line(2, 100.0, true),
+        ];
+        let pair = |keep, remove| Retake {
+            keep: UtteranceRange {
+                first: keep,
+                last: keep,
+            },
+            remove: UtteranceRange {
+                first: remove,
+                last: remove,
+            },
+        };
+        let valid = safe_retakes(vec![pair(3, 1), pair(3, 1), pair(3, 2), pair(8, 1)], &lines);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].remove, Range::new(0.1, 0.9));
+        assert!(safe_retakes(vec![pair(3, 1), pair(1, 3)], &lines).is_empty());
+    }
+}
