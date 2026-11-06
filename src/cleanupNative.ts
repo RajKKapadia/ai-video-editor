@@ -45,7 +45,6 @@ export async function analyzeTimeline(
   update: (progress: CleanupProgress) => void,
 ) {
   const id = uid();
-  let currentSource = '';
   let cancelling: Promise<unknown> | undefined;
   const cancel = () => {
     cancelling = invoke('cleanup_cancel', { id }).catch(() => {});
@@ -53,12 +52,7 @@ export async function analyzeTimeline(
   const unlisten = await listen<CleanupProgress & { id: string }>('timeline-cleanup-progress', ({ payload }) => {
     if (payload.id !== id) return;
     if (signal.aborted) cancel();
-    else update({
-      ...payload,
-      stage: currentSource && ['Analyzing speech', 'Transcribing the reviewed timeline'].includes(payload.stage)
-        ? payload.stage + ' · ' + currentSource
-        : payload.stage,
-    });
+    else update(payload);
   });
   let complete = false;
   signal.addEventListener('abort', cancel, { once: true });
@@ -78,14 +72,12 @@ export async function analyzeTimeline(
     for (const [index, clipId] of sources.entries()) {
       signal.throwIfAborted();
       const clip = clips.get(clipId);
-      const name = clip?.name ?? 'source media';
-      currentSource = (index + 1) + ' of ' + sources.length + ' · ' + name;
-      const stage = 'Preparing source ' + currentSource;
-      update({ stage, fraction: null });
       if (clip?.filePath) {
         await invoke('cleanup_source_finish', { id, original: { clipId, filePath: clip.filePath } });
         continue;
       }
+      const stage = 'Preparing source ' + (index + 1) + ' of ' + sources.length + ' · ' + (clip?.name ?? 'source media');
+      update({ stage, fraction: null });
       const blob = await readMedia(clipId, signal).catch(() => undefined);
       signal.throwIfAborted();
       if (!blob?.size || blob.size > 64 * 1024 ** 3) {

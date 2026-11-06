@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperVadContext, WhisperVadContextParams,
+    FullParams, SamplingStrategy, WhisperState, WhisperVadContext, WhisperVadContextParams,
     WhisperVadParams,
 };
 
@@ -26,13 +26,16 @@ const BOUNDARY_PADDING: f64 = 0.15;
 pub(super) struct Control {
     pub cancel: CancellationToken,
     pub(super) child: Mutex<Option<Child>>,
+    pub(super) speech_child: Mutex<Option<Child>>,
 }
 
 impl Control {
     pub fn stop(&self) {
         self.cancel.cancel();
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.kill();
+        for slot in [&self.child, &self.speech_child] {
+            if let Some(child) = slot.lock().unwrap().as_mut() {
+                let _ = child.kill();
+            }
         }
     }
 
@@ -48,8 +51,6 @@ impl Control {
 pub(super) struct Analysis {
     pub pauses: Vec<Range>,
     pub utterances: Vec<Utterance>,
-    pub transcript_issue: Option<String>,
-    pub runtime_notice: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,9 +65,11 @@ pub(super) struct Utterance {
 
 pub(super) struct Engine {
     vad: WhisperVadContext,
-    whisper: Option<PathBuf>,
-    pub(super) device: Option<i32>,
-    pub(super) threads: usize,
+}
+
+pub(super) struct PreparedAudio {
+    pub detected: Detected,
+    pub pcm: Option<NamedTempFile>,
 }
 
 impl Engine {
@@ -78,33 +81,19 @@ impl Engine {
         params.set_n_threads(1);
         let vad = WhisperVadContext::new(model_path(vad_path)?, params)
             .map_err(|_| "Could not load the local voice detector.")?;
-        Ok(Self {
-            vad,
-            whisper: None,
-            device: None,
-            threads: 4,
-        })
+        Ok(Self { vad })
     }
 
-    pub fn load_whisper(&mut self, path: &Path) -> Result<(), String> {
-        self.whisper = Some(path.to_owned());
-        Ok(())
-    }
-
-    pub fn stop_transcription(&mut self) {
-        self.whisper = None;
-    }
-
-    pub fn analyze(
+    pub fn prepare(
         &mut self,
         decoder: &Path,
         media: &Path,
         range: Range,
-        pauses: bool,
+        transcribe: bool,
         control: &Control,
         mut progress: impl Fn(f64),
-    ) -> Result<Analysis, String> {
-        let mut pcm = if self.whisper.is_some() {
+    ) -> Result<PreparedAudio, String> {
+        let mut pcm = if transcribe {
             Some(BufWriter::new(NamedTempFile::new().map_err(
                 |_| "Could not create speech analysis scratch space.",
             )?))
@@ -181,33 +170,11 @@ impl Engine {
         if !status.is_ok_and(|status| status.success()) || detected.duration <= 0.0 {
             return Err("No readable audio was found in this timeline range.".into());
         }
-        let mut result = Analysis::default();
-        if let (Some(whisper), Some(pcm)) = (&self.whisper, pcm) {
-            let pcm = pcm
-                .into_inner()
-                .map_err(|_| "Could not finish writing speech analysis scratch space.")?;
-            match super::worker::transcribe(
-                whisper,
-                pcm.path(),
-                &detected,
-                range.duration(),
-                self.device,
-                self.threads,
-                control,
-            ) {
-                Ok((utterances, notice)) => {
-                    result.utterances = utterances;
-                    result.runtime_notice = notice;
-                }
-                Err(error) => result.transcript_issue = Some(error),
-            }
-            progress(1.0);
-        }
-        control.check()?;
-        if pauses {
-            result.pauses = detected.pauses();
-        }
-        Ok(result)
+        let pcm = pcm
+            .map(BufWriter::into_inner)
+            .transpose()
+            .map_err(|_| "Could not finish writing speech analysis scratch space.")?;
+        Ok(PreparedAudio { detected, pcm })
     }
 
     fn detect(
@@ -277,11 +244,7 @@ impl Engine {
                 }
             }
             let decoded = (seconds(frames_read) / duration).min(1.0);
-            progress(if pcm.is_some() {
-                decoded * 0.35
-            } else {
-                decoded
-            });
+            progress(decoded);
             if final_window {
                 break;
             }
@@ -377,7 +340,11 @@ pub(super) struct Detected {
 }
 
 impl Detected {
-    fn pauses(&self) -> Vec<Range> {
+    pub fn has_speech(&self) -> bool {
+        !self.speech.is_empty()
+    }
+
+    pub fn pauses(&self) -> Vec<Range> {
         self.speech
             .windows(2)
             .filter_map(|speech| {
@@ -451,7 +418,7 @@ impl Detected {
 }
 
 pub(super) fn transcribe_local(
-    whisper: &WhisperContext,
+    state: &mut WhisperState,
     mut pcm: std::fs::File,
     detected: &Detected,
     source_duration: f64,
@@ -459,9 +426,6 @@ pub(super) fn transcribe_local(
     progress: &mut impl Fn(f64),
     threads: usize,
 ) -> Result<Vec<Utterance>, String> {
-    let mut state = whisper
-        .create_state()
-        .map_err(|_| "Could not initialize transcription.")?;
     let mut utterances = Vec::new();
     let mut bytes = Vec::new();
     let mut text_bytes = 0;
@@ -582,9 +546,6 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let media = work.path().join("offset.mp4");
         let mut engine = Engine::new(&fixture.join("ggml-silero-v5.1.2.bin")).unwrap();
-        engine
-            .load_whisper(&fixture.join("ggml-small.bin"))
-            .unwrap();
         let status = Command::new(&ffmpeg)
             .args([
                 "-v",
@@ -621,38 +582,34 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let control = Control::default();
-        let result = engine
-            .analyze(
-                &ffmpeg,
-                &media,
-                Range::new(0.5, 25.5),
-                true,
-                &control,
-                |_| {},
+        let range = Range::new(0.5, 25.5);
+        let prepared = engine
+            .prepare(&ffmpeg, &media, range, true, &control, |_| {})
+            .unwrap();
+        let pauses = prepared.detected.pauses();
+        let model = fixture.join("ggml-small.bin");
+        let (utterances, _) = super::super::worker::Transcriber::new(&model, None, 8, &control)
+            .transcribe(
+                prepared.pcm.unwrap().path(),
+                prepared.detected,
+                range.duration(),
             )
             .unwrap();
         assert!(
-            result.transcript_issue.is_none(),
-            "{:?}",
-            result.transcript_issue
-        );
-        assert!(
-            result
-                .pauses
+            pauses
                 .iter()
                 .any(|gap| gap.start > 10.0 && gap.start < 13.0 && gap.end > 12.0),
             "The intended gap was missing: {:?}",
-            result.pauses
+            pauses
         );
-        let transcript = result
-            .utterances
+        let transcript = utterances
             .iter()
             .map(|unit| unit.text.as_str())
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
         assert!(transcript.matches("country").count() >= 4, "{transcript}");
-        let first = result.utterances.first().unwrap();
+        let first = utterances.first().unwrap();
         assert!(
             first.speech.start >= 0.4 && first.speech.start <= 1.5,
             "First speech at {:?}",
@@ -661,7 +618,7 @@ mod tests {
         control.stop();
         assert!(
             engine
-                .analyze(
+                .prepare(
                     &ffmpeg,
                     &media,
                     Range::new(0.0, 3.0),
