@@ -22,7 +22,17 @@ export type CleanupReport = {
   speech?: SpeechSelection | null;
   runtimeNotice?: string | null;
   assistantTurn?: AssistantMessage[];
+  draftSummary?: string;
 };
+
+export function canPreviewCleanupDraft(timeline: Segment[], report: CleanupReport) {
+  if (!report.draftSummary || report.failedSources || report.retakeIssue) return false;
+  const removals = report.proposals.map(({ remove }) => remove);
+  return !removals.length || (
+    removals.every((remove) => makeCleanupEdit(timeline, [remove]) !== null) &&
+    makeCleanupEdit(timeline, removals) !== null
+  );
+}
 
 export function makeCleanupEdit(timeline: Segment[], ranges: TimeRange[]) {
   if (!ranges.length) return null;

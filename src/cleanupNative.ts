@@ -22,7 +22,7 @@ export type ProviderStatus = {
 export type ProviderSelection = { provider: Provider; config: ProviderConfig };
 
 export type CleanupProgress = { stage: string; fraction: number | null };
-export type AssistantStage = 'pauses' | 'cuts' | 'chat';
+export type AssistantStage = 'draft' | 'pauses' | 'cuts' | 'chat';
 export type AssistantRequest = { stage: AssistantStage; message: string; provider: ProviderSelection };
 export type CleanupOptions = { pauses: boolean; retakes: ProviderSelection | null; assistant?: AssistantRequest };
 

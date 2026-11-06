@@ -28,7 +28,7 @@ tempfile = "3"
 keyring = { version = "4.2", default-features = false, features = ["v1"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "sync"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 http-body-util = "0.1"

@@ -14,7 +14,7 @@ import { CleanupPanel } from './CleanupPanel';
 import { ExportPanel } from './ExportPanel';
 import { Icon, type IconName } from './Icon';
 import { analyzeTimeline, errorMessage, hasAnalyzableAudio, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
-import { makeCleanupEdit, minSegmentDuration, type AssistantMessage, type CleanupReport, type TimeRange } from './cleanupTimeline';
+import { canPreviewCleanupDraft, makeCleanupEdit, minSegmentDuration, type AssistantMessage, type CleanupReport, type TimeRange } from './cleanupTimeline';
 import { inspectMedia, storeMedia } from './cache';
 import { importConcurrency, mapConcurrent } from './resources';
 import { TimelineRuler, useTimelineZoom } from './timelineView';
@@ -121,7 +121,7 @@ export function Editor({
   const [importing, setImporting] = useState(false);
   const [dropping, setDropping] = useState(false);
   const [selectedSegment, setSelectedSegment] = useState<string | null>(null);
-  const [history, setHistory] = useState<Segment[][]>([]);
+  const [history, setHistory] = useState<{ before: Segment[]; after: Segment[] }[]>([]);
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportBusy, setExportBusy] = useState(false);
@@ -151,6 +151,8 @@ export function Editor({
   );
   const source = selectedId ? clipById.get(selectedId) : undefined;
   const sourceMarks = selectedId ? marks[selectedId] || {} : {};
+  const lastEdit = history[history.length - 1];
+  const canUndo = lastEdit?.after === project.timeline;
   const currentReview = cleanupReview?.snapshot === project.timeline && !!cleanupReview.assistant !== cleanupOpen
     ? cleanupReview
     : null;
@@ -462,10 +464,10 @@ export function Editor({
     if (targetMode === 'sequence') setSequenceMarks({});
     else if (selectedId) setMarks((existing) => ({ ...existing, [selectedId]: {} }));
   }
-  function changeTimeline(next: Segment[]) {
-    setHistory((previous) => [...previous.slice(-29), project.timeline]);
+  function changeTimeline(next: Segment[], expected?: Segment[]) {
+    setHistory((previous) => [...previous.slice(-29), { before: project.timeline, after: next }]);
     setSequenceMarks({});
-    onUpdate((current) => ({ ...current, timeline: next }));
+    onUpdate((current) => expected && current.timeline !== expected ? current : { ...current, timeline: next });
   }
   function insert(clip = source, position = sequenceTime) {
     if (!clip || previewing) return;
@@ -502,12 +504,11 @@ export function Editor({
     seek(sequenceTime, 'sequence');
   }
   function undo() {
-    if (previewing) return;
-    const previous = history[history.length - 1];
-    if (!previous) return;
-    onUpdate((current) => ({ ...current, timeline: previous }));
+    if (previewing || !canUndo || !lastEdit) return;
+    const { before, after } = lastEdit;
+    onUpdate((current) => current.timeline === after ? { ...current, timeline: before } : current);
     setHistory((items) => items.slice(0, -1));
-    setSequenceTime((time) => Math.min(time, sequenceLength(previous)));
+    setSequenceTime((time) => Math.min(time, sequenceLength(before)));
     setPlaying(false);
     setSelectedSegment(null);
     setSequenceMarks({});
@@ -573,12 +574,15 @@ export function Editor({
       setCheckedCuts(new Set());
     }
     if (stage === 'cuts') setPendingCuts(snapshot);
-    if (stage === 'pauses') setPendingCuts(null);
+    if (stage === 'pauses' || stage === 'draft') setPendingCuts(null);
     setCleanupError('');
     setCleanupProgress({ stage: stage ? 'Preparing the timeline assistant' : 'Preparing timeline cleanup', fraction: null });
     try {
       const report = await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
-      if (job.controller.signal.aborted) return;
+      if (cleanupJob.current !== job || job.controller.signal.aborted) return;
+      if (stage === 'draft' && !canPreviewCleanupDraft(snapshot, report)) {
+        throw new Error('The cleanup draft could not be applied safely to this timeline. Try a more specific brief.');
+      }
       const turn = report.assistantTurn;
       if (turn) setAssistantMessages((messages) => [...messages, ...turn]);
       if (stage !== 'chat') setCleanupReview({ snapshot: job.snapshot, report, assistant: stage });
@@ -633,7 +637,7 @@ export function Editor({
   function applyCleanup(nextAssistantStage?: AssistantRequest) {
     if (!cleanupEdit || !currentReview || cleanupJob.current) return;
     const position = previewing ? sequenceTime : cleanupEdit.mapTime(sequenceTime);
-    changeTimeline(cleanupEdit.timeline);
+    changeTimeline(cleanupEdit.timeline, currentReview.assistant === 'draft' ? currentReview.snapshot : undefined);
     setCleanupReview(null);
     setCheckedCuts(new Set());
     setPreview(false);
@@ -1674,7 +1678,7 @@ export function Editor({
               icon="undo"
               label="Undo timeline edit"
               onClick={undo}
-              disabled={!history.length || previewing}
+              disabled={!canUndo || previewing}
             />
             <span className="tool-divider" />
             <button

@@ -18,9 +18,11 @@ Run `bun test` for range-edit checks. With a disposable Chrome profile and Vite 
 
 ## Assistant and timeline cleanup
 
-Open **Assistant** in the desktop editor and configure an AI provider in Settings. **Analyze transcript and pauses** runs Whisper on the timeline and asks the provider which measured quiet gaps are expendable in context. The assistant uses what is said around each gap to infer its purpose. Play the original gap or preview the join to check what happens on screen.
+Open **Assistant** in the desktop editor and configure an AI provider in Settings. Enter an editing brief such as “Remove false starts and repeated takes, but leave the pauses where I demonstrate something,” then select **Draft cleanup**. A blank brief asks for conservative cuts. Cutline runs Whisper and voice detection locally, then sends the brief, transcript text, and timing evidence to the selected provider. Drafts use the current timeline and brief as context. Media and file paths stay on the device.
 
-Select **Apply pauses and find cuts** to shorten the checked gaps and run Whisper again on the edited sequence. You can also continue with the original pauses. The assistant uses the fresh transcript to propose removals such as false starts and redundant takes. Review and apply those cuts separately. Both edit steps support Undo. Add editing direction in the prompt or use **Ask about transcript** for questions about the current sequence. Whisper runs locally. Your selected provider receives transcript text and recent conversation.
+Review the proposed removals and play the original footage to check what happens on screen. Check the cuts you want, preview the joins, then select **Apply selected**. One Undo restores the prior timeline. Edits made during drafting or review require a fresh draft. Draft cleanup supports up to 48 KiB of transcript text and 96 KiB of serialized context. If the timeline exceeds those limits, use a shorter sequence. Restore any unavailable audio sources before retrying an incomplete analysis.
+
+Under **Advanced**, use **Analyze transcript and pauses** to review measured gaps separately. **Apply pauses and find cuts** shortens the checked gaps and transcribes the edited timeline for a second review. You can also find cuts with the original pauses. Each apply step supports Undo. **Ask about transcript** answers questions about the current sequence. Advanced analysis and transcript questions send recent conversation to the provider along with the transcript.
 
 In the desktop app, select **Clean up timeline** to shorten quiet pauses, compare repeated takes, or do both. The first run downloads the Silero v5.1.2 voice detector (under 1 MB). Retake analysis downloads your selected multilingual Whisper model and transcribes locally. FFmpeg must be on PATH. The desktop build uses CMake and libclang to compile the local speech engine.
 
@@ -62,9 +64,9 @@ Desktop imports link to the original media by absolute path. If a file is moved,
 
 Desktop project details, timeline edits, and thumbnails are stored in `workspace/projects.json` under the app cache. Deleting the `workspace` folder clears the project list. The source files live at their original paths.
 
-Cutline saves transcripts in `workspace/transcripts/project-<project-id>.json`. Each utterance includes text, a clip ID, and timestamps in seconds for the analyzed timeline and the original clip. The transcript records the selected model file, engine version, and final processing device. Transcript questions reuse a complete cached transcript for the same timeline. Assistant pause review and cut planning each transcribe the current timeline afresh.
+Cutline saves transcripts in `workspace/transcripts/project-<project-id>.json`. Each utterance includes text, a clip ID, and timestamps in seconds for the analyzed timeline and the original clip. The transcript records the selected model file, engine version, and final processing device. Transcript questions reuse a complete cached transcript for the same timeline. Draft cleanup transcribes once per run. Advanced pause review and cut planning each transcribe the current timeline afresh.
 
-The assistant saves completed conversation turns by project in `workspace/assistant.sqlite3` and restores them when you reopen the project. Deleting the workspace clears the project list, transcripts, and conversations.
+The assistant saves completed conversation turns from Advanced and transcript questions by project in `workspace/assistant.sqlite3` and restores them when you reopen the project. Cleanup drafts live in the current editor session. Deleting the workspace clears the project list, transcripts, and conversations.
 
 | OS | Desktop workspace cache | Speech models |
 | --- | --- | --- |

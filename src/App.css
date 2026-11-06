@@ -3517,6 +3517,19 @@ kbd {
   flex-wrap: wrap;
   gap: 6px;
 }
+.assistant-advanced summary {
+  width: fit-content;
+  color: #bdb6ae;
+  font-size: 11px;
+  cursor: pointer;
+}
+.assistant-advanced .assistant-actions {
+  margin-top: 6px;
+}
+.assistant-draft-summary {
+  margin: 0 0 10px;
+  overflow-wrap: anywhere;
+}
 .assistant-panel .cleanup-progress {
   margin: 8px 0;
 }
