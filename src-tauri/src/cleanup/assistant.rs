@@ -1,3 +1,5 @@
+pub(super) mod draft;
+
 use std::{collections::HashSet, path::Path};
 
 use rusqlite::{Connection as Database, params};
@@ -14,10 +16,14 @@ use super::{
 };
 
 const DATABASE_FILE: &str = "assistant.sqlite3";
+const INPUT_LIMIT: usize = 96 * 1024;
+const INPUT_TOO_LARGE: &str =
+    "The transcript and context exceed the assistant’s input limit. Use a shorter sequence.";
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum Stage {
+    Draft,
     Pauses,
     Cuts,
     Chat,
@@ -26,6 +32,7 @@ pub(super) enum Stage {
 impl Stage {
     pub fn progress(self) -> &'static str {
         match self {
+            Self::Draft => "Planning cleanup from the timeline transcript",
             Self::Pauses => "Reviewing transcript context around quiet gaps",
             Self::Cuts => "Planning cuts from the refreshed transcript",
             Self::Chat => "Reading the transcript",
@@ -214,8 +221,9 @@ const CONTEXT: &str = "You are Cutline's editing assistant. Read the complete cu
     cannot see the footage. Preserve ambiguous material, unique information, intentional repetitions, demonstrations and \
     deliberate beats. Respond in JSON with a brief summary, a pauses array and a cuts array.";
 
-fn stage_instruction(stage: Stage) -> &'static str {
-    match stage {
+fn stage_instruction(stage: Stage) -> Result<&'static str, String> {
+    Ok(match stage {
+        Stage::Draft => return Err("Use the draft planner for cleanup drafts.".into()),
         Stage::Pauses => {
             "Summarize the spoken content, then select only clearly dispensable quiet gaps from quietGaps. \
             Each gap links to the surrounding transcript IDs. Preserve gaps around instructions to look, wait, watch, read, listen or \
@@ -235,7 +243,7 @@ fn stage_instruction(stage: Stage) -> &'static str {
             "Answer the user's question in summary using the current transcript. Be clear if the transcript does not answer it. \
             Return pauses and cuts as []."
         }
-    }
+    })
 }
 
 fn task_schema() -> serde_json::Value {
@@ -273,6 +281,7 @@ pub(super) async fn review(
         .as_ref()
         .ok_or("No assistant task was selected.")?;
     let stage = *stage;
+    let stage_instruction = stage_instruction(stage)?;
     let project_id = session
         .project_id
         .clone()
@@ -314,14 +323,11 @@ pub(super) async fn review(
         "quietGaps": gaps,
         "cutBoundaries": cut_boundaries,
     }).to_string();
-    if input.len() > 96 * 1024 {
-        return Err("The transcript and context exceed the assistant’s input limit. Use a shorter sequence.".into());
+    if input.len() > INPUT_LIMIT {
+        return Err(INPUT_TOO_LARGE.into());
     }
     let schema = task_schema();
-    let instructions = format!(
-        "{CONTEXT} {} Response schema: {schema}",
-        stage_instruction(stage)
-    );
+    let instructions = format!("{CONTEXT} {stage_instruction} Response schema: {schema}");
     let reply = connection
         .complete(
             &input,
@@ -341,7 +347,7 @@ pub(super) async fn review(
     let mut proposals = match stage {
         Stage::Pauses => pause_proposals(gaps, reply.pauses),
         Stage::Cuts => cut_proposals(utterances, reply.cuts),
-        Stage::Chat => Vec::new(),
+        Stage::Chat | Stage::Draft => Vec::new(),
     };
     proposals.sort_by(|left, right| left.remove.start.total_cmp(&right.remove.start));
     let mut answer = bounded(&reply.summary, 3500);
@@ -350,7 +356,7 @@ pub(super) async fn review(
             answer.push_str(&format!("\n\nQuiet gaps to review: {}.", proposals.len()))
         }
         Stage::Cuts => answer.push_str(&format!("\n\nCuts to review: {}.", proposals.len())),
-        Stage::Chat => (),
+        Stage::Chat | Stage::Draft => (),
     }
     session.control.check()?;
     let handle = app.clone();
@@ -442,12 +448,7 @@ fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) 
             !candidates
                 .iter()
                 .enumerate()
-                .any(|(other, (_, candidate))| {
-                    *index != other
-                        && (cut.remove.overlaps(candidate.remove)
-                            || cut.keep.is_some_and(|keep| keep.overlaps(candidate.remove))
-                            || candidate.keep.is_some_and(|keep| keep.overlaps(cut.remove)))
-                })
+                .any(|(other, (_, candidate))| *index != other && conflicts(cut, candidate))
         })
         .map(|(_, entry)| entry)
         .collect();
@@ -455,6 +456,12 @@ fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) 
         return Vec::new();
     }
     approved.into_iter().map(|(_, cut)| cut.clone()).collect()
+}
+
+fn conflicts(left: &Proposal, right: &Proposal) -> bool {
+    left.remove.overlaps(right.remove)
+        || left.keep.is_some_and(|keep| keep.overlaps(right.remove))
+        || right.keep.is_some_and(|keep| keep.overlaps(left.remove))
 }
 
 #[cfg(test)]

@@ -90,10 +90,10 @@ export function AssistantPanel({
       </div>
       <div className="cleanup-body">
         <div className="assistant-controls">
-          <p className="provider-note">Review quiet gaps in context, then transcribe the reviewed timeline to plan cuts.</p>
+          <p className="provider-note">Draft cuts for false starts, repeated takes, and quiet gaps, then review them together.</p>
           <p className="provider-note">
             {ready && active && profile
-              ? <>Whisper runs locally. Transcript text and recent conversation go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}.</>
+              ? <>Whisper runs locally. Your brief, transcript, and timing go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}. Transcript questions and Advanced analysis also send recent conversation.</>
               : providerError || providerStatus?.warning || 'Set up an AI provider to use the timeline assistant.'}
             {' '}<button className="text-link" type="button" onClick={() => onSettings('providers')}>AI providers</button>
             {' · '}<button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription</button>
@@ -114,18 +114,31 @@ export function AssistantPanel({
               disabled={!!progress}
             />
             <div className="assistant-actions">
-              {!reviewingPauses && !needsCuts && (
-                <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('pauses', 'Analyze the transcript and suggest quiet gaps to shorten.')}>
-                  {report ? 'Review pauses again' : 'Analyze transcript and pauses'}
-                </button>
-              )}
-              {needsCuts && (
-                <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('cuts', 'Transcribe the reviewed timeline again and suggest cuts.')}>
-                  Transcribe and find cuts
-                </button>
-              )}
+              <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', 'Suggest cuts for clear false starts, repeated takes, and dispensable quiet gaps. Preserve unique details and pauses that may be part of a demonstration.')}>
+                Draft cleanup
+              </button>
               <button type="submit" className="button secondary" disabled={!canRun || !prompt.trim()}>Ask about transcript</button>
             </div>
+            <details className="assistant-advanced">
+              <summary>Advanced</summary>
+              <div className="assistant-actions">
+                {!reviewingPauses && !needsCuts && (
+                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('pauses', 'Analyze the transcript and suggest quiet gaps to shorten.')}>
+                    {report && !report.draftSummary ? 'Review pauses again' : 'Analyze transcript and pauses'}
+                  </button>
+                )}
+                {needsCuts && (
+                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Transcribe the reviewed timeline again and suggest cuts.')}>
+                    Transcribe and find cuts
+                  </button>
+                )}
+                {reviewingPauses && (
+                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Keep the pauses as they are. Transcribe the reviewed timeline and suggest cuts.')}>
+                    Find cuts without removing pauses
+                  </button>
+                )}
+              </div>
+            </details>
           </form>
         </div>
         {progress && (
@@ -138,6 +151,7 @@ export function AssistantPanel({
         {error && <p className="cleanup-warning" role="alert">{error}</p>}
         {!progress && report && (
           <>
+            {report.draftSummary && <p className="assistant-draft-summary">{report.draftSummary}</p>}
             <CutReview
               report={report}
               {...review}
@@ -152,11 +166,6 @@ export function AssistantPanel({
                 ? () => submit('cuts', 'I applied the selected pause removals. Transcribe the edited timeline and suggest cuts.', true)
                 : review.onApply}
             />
-            {reviewingPauses && (
-              <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Keep the pauses as they are. Transcribe the reviewed timeline and suggest cuts.')}>
-                Find cuts without removing pauses
-              </button>
-            )}
           </>
         )}
         {historyError && <p className="cleanup-warning" role="alert">{historyError}</p>}

@@ -4,12 +4,18 @@ import { connect, until } from './browser-session.mjs';
 const browser = await connect(Number(process.env.CHROME_PORT || 9333));
 const url = process.env.CUTLINE_URL || 'http://127.0.0.1:1420/';
 const evaluate = browser.evaluate;
-const waitFor = (expression) => until(() => evaluate(expression));
+const waitFor = (expression) => until(async () => {
+  try {
+    return await evaluate(expression);
+  } catch (error) {
+    if (!/Inspected target navigated|Cannot find context/.test(error.message)) throw error;
+    return false;
+  }
+});
 async function click(text) {
-  const button = "Array.from(document.querySelectorAll('button')).find(button => button.textContent.trim() === " +
+  const button = "Array.from(document.querySelectorAll('button')).find(button => !button.disabled && button.textContent.trim() === " +
     JSON.stringify(text) + ')';
-  await waitFor('!!(' + button + ') && !(' + button + ').disabled');
-  await evaluate(button + '.click()');
+  await waitFor('(() => { const button = ' + button + '; if (!button) return false; button.click(); return true; })()');
 }
 const savedTimeline = () => evaluate("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline");
 const openCleanup = async () => {
@@ -24,6 +30,7 @@ try {
     source: `
       window.isTauri = true;
       window.cleanupCalls = [];
+      window.assistantRequests = [];
       window.cleanupMock = { mode: "success" };
       window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
       window.__TAURI_INTERNALS__ = {
@@ -46,23 +53,31 @@ try {
               openAi: { model: "test-model", baseUrl: null, hasKey: true, ready: true }
             } };
           }
+          if (command === "assistant_history") return [];
           if (command === "cleanup_begin") {
             if (args.projectId !== "cleanup-check") throw new Error("Missing cleanup project ID");
+            cleanupMock.stage = args.assistant?.stage;
+            if (args.assistant) assistantRequests.push(args.assistant);
             return ["speech"];
           }
           if (["cleanup_source_begin", "cleanup_source_push", "cleanup_source_finish", "cleanup_cancel"].includes(command)) return null;
           if (command === "cleanup_finish") {
-            if (cleanupMock.mode === "stale") await new Promise(resolve => setTimeout(resolve, 500));
+            const { mode, stage } = cleanupMock;
+            if (mode === "stale") await new Promise(resolve => setTimeout(resolve, 500));
+            const pause = { kind: "pause", remove: { start: .55, end: 1.3 }, keep: null, keptText: null, removedText: null };
+            const retake = { kind: "retake", remove: { start: 2.4, end: 3.2 }, keep: { start: .05, end: .30 }, keptText: "Keep this line", removedText: "An earlier attempt" };
+            if (stage === "draft" && mode === "unavailable") throw new Error("Some timeline sources could not be analyzed.");
             return {
               failedSources: 0,
               transcriptCacheIssue: null,
-              retakeIssue: cleanupMock.mode === "partial" ? "The AI provider timed out." : null,
-              proposals: [
-                { kind: "pause", remove: { start: .55, end: 1.3 }, keep: null, keptText: null, removedText: null },
-                ...(cleanupMock.mode === "success" ? [
-                  { kind: "retake", remove: { start: 2.4, end: 3.2 }, keep: { start: .05, end: .30 }, keptText: "Keep this line", removedText: "An earlier attempt" }
-                ] : []),
-              ]
+              retakeIssue: mode === "partial" ? "The AI provider timed out." : null,
+              ...(stage === "draft" && { draftSummary: "Review the proposed edits." }),
+              ...(stage === "chat" && { assistantTurn: [{ id: 1, role: "assistant", text: "Transcript answer" }] }),
+              proposals: stage === "draft" ? (
+                mode === "invalid" ? [{ ...pause, remove: { start: .01, end: 1.3 } }] :
+                mode === "empty" ? [] : [pause, retake]
+              ) : stage === "chat" ? [] : stage === "cuts" ? [retake] :
+                mode === "success" && !stage ? [pause, retake] : [pause],
             };
           }
           throw new Error("Unexpected mock command " + command + " " + String(args));
@@ -138,6 +153,81 @@ try {
   await waitFor("cleanupCalls.includes('cleanup_cancel') && !document.querySelector('.cleanup-progress')");
   assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 0);
   console.log('Cleanup review, audition, join preview, apply, undo, reopening, provider fallback, and stale analysis passed.');
+
+  // Restore the original two takes in the disposable profile.
+  await evaluate("(() => {const snapshot = JSON.parse(sessionStorage.getItem('mockProjectCache'));" +
+    "snapshot.projects[0].timeline = " + JSON.stringify(before) + ";" +
+    "sessionStorage.setItem('mockProjectCache', JSON.stringify(snapshot)); window.reloadingAssistantCheck = true;})()");
+  await browser.send('Page.reload');
+  await waitFor("!window.reloadingAssistantCheck && !!document.querySelector('.editor-shell')");
+  await click('Assistant');
+  await waitFor("document.querySelector('.assistant-panel')?.textContent.includes('test-model')");
+  assert.equal(await evaluate("document.querySelector('.assistant-advanced').open"), false);
+
+  await click('Draft cleanup');
+  await waitFor("document.querySelectorAll('.cleanup-results li').length === 2");
+  assert.equal(await evaluate("assistantRequests[0].stage"), 'draft');
+  assert.match(await evaluate("assistantRequests[0].message"), /Preserve unique details/);
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 0);
+  await click('Play kept take');
+  await waitFor("document.querySelector('video').currentTime >= .25 && document.querySelector('video').paused");
+  await evaluate("document.querySelectorAll('.cleanup-results input')[1].click()");
+  await click('Preview join');
+  await waitFor("document.querySelector('.stage-label').textContent.includes('CLEANUP PREVIEW')");
+  assert.deepEqual(await savedTimeline(), before);
+  await click('Apply selected');
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 3");
+  assert.deepEqual((await savedTimeline()).map(({ in: start, out }) => [start, out].map(time => Number(time.toFixed(3)))), [[0, 2], [0, .4], [1.2, 2]]);
+  await evaluate("document.querySelector('[aria-label=\"Undo timeline edit\"]').click()");
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 2");
+  assert.deepEqual(await savedTimeline(), before);
+
+  for (const [mode, message] of [
+    ['invalid', 'could not be applied safely'],
+    ['unavailable', 'sources could not be analyzed'],
+    ['empty', 'No cuts suggested'],
+  ]) {
+    await evaluate('cleanupMock.mode = ' + JSON.stringify(mode));
+    await click('Draft cleanup');
+    await waitFor("document.querySelector('.assistant-panel')?.textContent.includes(" + JSON.stringify(message) + ")");
+    assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 0);
+    assert.deepEqual(await savedTimeline(), before);
+  }
+
+  async function removeTimelineSegment() {
+    await evaluate("document.querySelector('.timeline-segment.video').click()");
+    await waitFor("!document.querySelector('[aria-label=\"Remove selected segment\"]').disabled");
+    await evaluate("document.querySelector('[aria-label=\"Remove selected segment\"]').click()");
+    await waitFor("document.querySelector('.assistant-panel')?.textContent.includes('The timeline changed.')");
+    await waitFor("!document.querySelector('.cleanup-progress')");
+    assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 0);
+    await evaluate("document.querySelector('[aria-label=\"Undo timeline edit\"]').click()");
+    await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 2");
+    assert.deepEqual(await savedTimeline(), before);
+  }
+  await evaluate("cleanupMock.mode = 'stale'; cleanupCalls.length = 0");
+  await click('Draft cleanup');
+  await waitFor("cleanupCalls.includes('cleanup_finish')");
+  await removeTimelineSegment();
+  assert.ok(await evaluate("cleanupCalls.includes('cleanup_cancel')"));
+  await evaluate("cleanupMock.mode = 'success'");
+  await click('Draft cleanup');
+  await waitFor("document.querySelectorAll('.cleanup-results li').length === 2");
+  await removeTimelineSegment();
+
+  await evaluate("document.querySelector('.assistant-advanced summary').click()");
+  await click('Analyze transcript and pauses');
+  await waitFor("!!document.querySelector('[aria-label=\"Suggested pauses\"]')");
+  await click('Find cuts without removing pauses');
+  await waitFor("document.querySelector('[aria-label=\"Suggested cuts\"]')?.textContent.includes('An earlier attempt')");
+  assert.deepEqual(await evaluate("assistantRequests.slice(-2).map(request => request.stage)"), ['pauses', 'cuts']);
+  await evaluate("(() => {const prompt = document.querySelector('#timeline-assistant-prompt');" +
+    "Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(prompt, 'What was said?');" +
+    "prompt.dispatchEvent(new Event('input', { bubbles: true }));})()");
+  await click('Ask about transcript');
+  await waitFor("document.querySelector('.assistant-conversation')?.textContent.includes('Transcript answer')");
+  assert.equal(await evaluate("assistantRequests.at(-1).stage"), 'chat');
+  console.log('Assistant draft preview, selective apply, undo, invalid and empty results, stale drafts, Advanced, and Q&A passed.');
 } finally {
   if (scriptId) await browser.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId });
   browser.close();

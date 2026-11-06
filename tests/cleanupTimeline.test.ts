@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { makeCleanupEdit } from '../src/cleanupTimeline';
+import { canPreviewCleanupDraft, makeCleanupEdit, type CleanupReport } from '../src/cleanupTimeline';
 import { sequenceLength, type Segment } from '../src/types';
 
 const original: Segment[] = [
@@ -36,5 +36,16 @@ describe('cleanup timeline', () => {
     expect(makeCleanupEdit(original, [{ start: 0, end: 11 }])).toBeNull();
     expect(makeCleanupEdit(original, [{ start: 2, end: 12 }])).toBeNull();
     expect(makeCleanupEdit(original, [{ start: NaN, end: 2 }])).toBeNull();
+  });
+
+  test('rejects a draft that only creates a sub-frame fragment when cuts are combined', () => {
+    const report: CleanupReport = {
+      draftSummary: 'Draft', failedSources: 0, retakeIssue: null, transcriptCacheIssue: null,
+      proposals: [{ start: 1, end: 2 }, { start: 2.01, end: 3 }].map((remove) => ({
+        kind: 'pause', remove, keep: null, keptText: null, removedText: null,
+      })),
+    };
+    expect(canPreviewCleanupDraft(original, { ...report, proposals: report.proposals.slice(0, 1) })).toBe(true);
+    expect(canPreviewCleanupDraft(original, report)).toBe(false);
   });
 });

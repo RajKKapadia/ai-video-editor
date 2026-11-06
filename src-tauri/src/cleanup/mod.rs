@@ -237,7 +237,10 @@ pub(crate) async fn cleanup_begin(
             );
         }
         (
-            request.stage == assistant::Stage::Pauses,
+            matches!(
+                request.stage,
+                assistant::Stage::Pauses | assistant::Stage::Draft
+            ),
             Some(request.provider),
             Some((request.stage, message.to_owned())),
         )
@@ -679,6 +682,8 @@ pub(crate) struct Report {
     runtime_notice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     assistant_turn: Option<Vec<assistant::Message>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_summary: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -754,7 +759,20 @@ async fn proposals(
         speech,
         runtime_notice,
         assistant_turn: None,
+        draft_summary: None,
     };
+    let drafting = session
+        .assistant
+        .as_ref()
+        .is_some_and(|(stage, _)| *stage == assistant::Stage::Draft);
+    if drafting {
+        if let Some(issue) = report.retake_issue {
+            return Err(issue);
+        }
+        if failed_sources != 0 {
+            return Err("Some timeline sources could not be analyzed. Restore the media or check its audio, then run Draft cleanup again.".into());
+        }
+    }
     let candidates: Vec<_> = session
         .runs
         .iter()
@@ -821,7 +839,7 @@ async fn proposals(
         transcript = Some(saved);
     }
     session.control.check()?;
-    if let Some((stage, _)) = &session.assistant {
+    if let Some((stage, message)) = &session.assistant {
         if let Some(issue) = report.retake_issue {
             return Err(issue);
         }
@@ -831,6 +849,20 @@ async fn proposals(
         let connection = connection.ok_or("The assistant’s AI provider is unavailable.")?;
         let gaps = assistant::transcript_gaps(candidates, &utterances);
         progress(app, &session.id, stage.progress(), None);
+        if drafting {
+            let draft = assistant::draft::run(
+                &connection,
+                message,
+                &utterances,
+                &gaps,
+                &session.control.cancel,
+            )
+            .await?;
+            session.control.check()?;
+            report.proposals = draft.proposals;
+            report.draft_summary = Some(draft.summary);
+            return Ok(report);
+        }
         let (proposals, turn) = assistant::review(
             app,
             session,
