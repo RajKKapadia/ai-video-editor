@@ -42,10 +42,8 @@ The [Desktop installers workflow](.github/workflows/desktop.yml) builds four ins
 | `.deb` | Debian-based Linux, x86-64, built on Ubuntu 22.04 |
 | `.rpm` | Enterprise Linux 10, x86-64, built on Rocky Linux 10 with EPEL. Enable EPEL and the distro's builder repository for WebKitGTK 4.1. |
 | `.exe` | Windows x86-64, NSIS installer |
-| `.dmg` | macOS, with a universal app for Apple Silicon and Intel |
+| `.dmg` | macOS 11 or later, with a universal app for Apple Silicon and Intel |
 
 To publish, bump `version` in `src-tauri/tauri.conf.json` and merge the change to `main`. After all four builds pass, the workflow creates a GitHub Release and attaches the installers under a tag such as `v0.1.1`. To publish the current version after a failed release build, run **Desktop installers** manually on `main` with **Publish the current version from main** enabled.
-
-The Windows installer is unsigned. macOS builds use ad-hoc signing by default. To sign and notarize builds from `main`, set `APPLE_CERTIFICATE` (a base64-encoded Developer ID Application certificate and private key in a `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD` (an app-specific password), and `APPLE_TEAM_ID` as GitHub Actions secrets. [Tauri macOS signing guide](https://v2.tauri.app/distribute/sign/macos/)
 
 Install FFmpeg and ffprobe separately for waveforms, speech cleanup, and MP4 export. The installed app must be able to find both on its PATH.

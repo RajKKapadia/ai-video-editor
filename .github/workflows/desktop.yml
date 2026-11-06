@@ -59,6 +59,9 @@ jobs:
             git ca-certificates tar gzip xz unzip file python3 \
             gcc-c++ make cmake clang clang-devel dbus-devel openssl-devel \
             pkgconf-pkg-config webkit2gtk4.1-devel librsvg2-devel rpm-build
+          # The Rocky image has no explicit PATH for Actions to extend.
+          test -x /usr/bin/unzip
+          echo /usr/bin >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v6
         with:
