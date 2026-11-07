@@ -34,7 +34,7 @@ impl Stage {
         match self {
             Self::Draft => "Planning cleanup from the timeline transcript",
             Self::Pauses => "Reviewing transcript context around quiet gaps",
-            Self::Cuts => "Planning cuts from the refreshed transcript",
+            Self::Cuts => "Planning cuts from the current transcript",
             Self::Chat => "Reading the transcript",
         }
     }
@@ -231,7 +231,7 @@ fn stage_instruction(stage: Stage) -> Result<&'static str, String> {
             A pause's length alone is insufficient evidence. For each selection return its gap id and a short reason. Return cuts as []."
         }
         Stage::Cuts => {
-            "Use the refreshed transcript to propose high-confidence removals of complete utterances, such as redundant takes, \
+            "Use the current transcript to propose high-confidence removals of complete utterances, such as redundant takes, \
             abandoned starts or explicit recording chatter. Use the user's editing direction and retain the strongest complete version \
             of any repeated material and all unique details. Each cut has a remove range with inclusive first and last utterance IDs \
             and a short reason. For repeated takes include the range of the kept version in keep. For other cuts set keep to null. \

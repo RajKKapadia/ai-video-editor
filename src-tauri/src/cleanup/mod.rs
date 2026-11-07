@@ -1,5 +1,6 @@
 pub(crate) mod assistant;
 mod audio;
+mod cache;
 mod models;
 mod pipeline;
 pub(crate) mod providers;
@@ -23,7 +24,7 @@ use tauri::{
 use tempfile::NamedTempFile;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
-use crate::project_cache::{MediaInput, approved_media, read_transcript, store_transcript};
+use crate::project_cache::{MediaInput, approved_media, store_transcript};
 
 use audio::{Analysis, Control};
 use pipeline::{Pipeline, Source};
@@ -165,6 +166,7 @@ struct Upload {
     clip_id: String,
     file: NamedTempFile,
     remaining: u64,
+    digest: Sha256,
 }
 
 #[derive(Default)]
@@ -173,7 +175,8 @@ struct Data {
     speech: Option<speech::Selection>,
     runtime_notice: Option<String>,
     connection: Option<Connection>,
-    cached_transcript: Option<CachedTranscript>,
+    processing_device: Option<String>,
+    analysis_cache_issue: Option<String>,
     retake_issue: Option<String>,
     upload: Option<Upload>,
     staged: bool,
@@ -298,13 +301,7 @@ pub(crate) async fn cleanup_begin(
     if result.is_err() {
         jobs.take(Some(&id));
     }
-    result.map(|()| {
-        if session.data.lock().unwrap().cached_transcript.is_some() {
-            Vec::new()
-        } else {
-            sources
-        }
-    })
+    result.map(|()| sources)
 }
 
 async fn setup(
@@ -327,36 +324,6 @@ async fn setup(
     } else {
         None
     };
-    if session
-        .assistant
-        .as_ref()
-        .is_some_and(|(stage, _)| *stage == assistant::Stage::Chat)
-        && let Some(project_id) = &session.project_id
-    {
-        let handle = app.clone();
-        let project_id = project_id.clone();
-        let cached = tauri::async_runtime::spawn_blocking(move || {
-            read_transcript::<CachedTranscript>(&handle, &project_id)
-                .ok()
-                .flatten()
-        })
-        .await
-        .ok()
-        .flatten();
-        session.control.check()?;
-        if let Some(cached) = cached.filter(|transcript| {
-            transcript.timeline_key == session.timeline_key
-                && transcript.failed_sources == 0
-                && transcript.transcription_issue.is_none()
-                && !transcript.utterances.is_empty()
-        }) {
-            let mut data = session.data.lock().unwrap();
-            data.pending.clear();
-            data.cached_transcript = Some(cached);
-            data.connection = connection;
-            return Ok(());
-        }
-    }
     progress(app, &session.id, "Preparing voice detection", None);
     let vad = models::install(app, &models::VAD, cancel, |bytes, total| {
         progress(
@@ -430,6 +397,7 @@ pub(crate) fn cleanup_source_begin(
         clip_id,
         file,
         remaining: bytes,
+        digest: Sha256::new(),
     });
     Ok(())
 }
@@ -460,6 +428,7 @@ pub(crate) async fn cleanup_source_push(
         .file
         .write_all(bytes)
         .map_err(|_| "Could not stage source media. Check free disk space.")?;
+    upload.digest.update(bytes);
     upload.remaining -= bytes.len() as u64;
     Ok(())
 }
@@ -526,9 +495,9 @@ pub(crate) async fn cleanup_source_finish(
         if data.working {
             return Err("This timeline source is not ready for analysis.".into());
         }
-        let (clip_id, input) = match linked {
+        let (clip_id, input, upload_key) = match linked {
             Some((clip_id, input)) if data.upload.is_none() && data.pending.contains(&clip_id) => {
-                (clip_id, input)
+                (clip_id, input, None)
             }
             Some(_) => return Err("This timeline source is not ready for analysis.".into()),
             None => {
@@ -540,7 +509,8 @@ pub(crate) async fn cleanup_source_finish(
                     return Err("The timeline source transfer is incomplete.".into());
                 }
                 let upload = data.upload.take().unwrap();
-                (upload.clip_id, MediaInput::Scratch(upload.file))
+                let key = format!("upload:{:x}", upload.digest.finalize());
+                (upload.clip_id, MediaInput::Scratch(upload.file), Some(key))
             }
         };
         // Keep only one staged legacy file at a time. Linked sources queue immediately.
@@ -556,6 +526,7 @@ pub(crate) async fn cleanup_source_finish(
             Source {
                 clip_id,
                 input,
+                upload_key,
                 released: release,
             },
             released,
@@ -634,7 +605,7 @@ pub(crate) async fn cleanup_finish(app: AppHandle, id: String) -> Result<Report,
     let pipeline = {
         let mut data = session.data.lock().unwrap();
         if data.working
-            || (data.pipeline.is_none() && data.cached_transcript.is_none())
+            || data.pipeline.is_none()
             || data.upload.is_some()
             || !data.pending.is_empty()
         {
@@ -671,18 +642,19 @@ async fn proposals(
     retake_issue: Option<String>,
     failed_sources: usize,
 ) -> Result<Report, String> {
-    let (speech, runtime_notice, cached) = {
+    let (speech, runtime_notice, processing_device, cache_issue) = {
         let mut data = session.data.lock().unwrap();
         (
             data.speech.clone(),
             data.runtime_notice.clone(),
-            data.cached_transcript.take(),
+            data.processing_device.take(),
+            data.analysis_cache_issue.take(),
         )
     };
     let mut report = Report {
         proposals: Vec::new(),
         retake_issue,
-        transcript_cache_issue: None,
+        transcript_cache_issue: cache_issue,
         failed_sources,
         speech,
         runtime_notice,
@@ -727,7 +699,7 @@ async fn proposals(
     }
     session.control.check()?;
     let utterances = ordered_utterances(&session.runs, &results);
-    let mut transcript = cached;
+    let mut transcript = None;
     if !utterances.is_empty() || (session.assistant.is_some() && report.speech.is_some()) {
         let fresh = CachedTranscript {
             model: report
@@ -736,12 +708,7 @@ async fn proposals(
                 .map(|selection| selection.model.file().name.to_owned())
                 .unwrap_or_else(|| "unknown".into()),
             engine: whisper_rs::WHISPER_CPP_VERSION.into(),
-            processing_device: report
-                .speech
-                .as_ref()
-                .and_then(|selection| selection.device.as_ref())
-                .map(|device| device.name.clone())
-                .unwrap_or_else(|| "CPU".into()),
+            processing_device: processing_device.unwrap_or_else(|| "CPU".into()),
             generated_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -763,7 +730,7 @@ async fn proposals(
                 .collect(),
         };
         let (saved, outcome) = save_transcript(app, session, fresh).await?;
-        report.transcript_cache_issue = outcome;
+        report.transcript_cache_issue = report.transcript_cache_issue.or(outcome);
         transcript = Some(saved);
     }
     session.control.check()?;

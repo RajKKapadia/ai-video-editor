@@ -21,6 +21,7 @@ const OVERLAP: usize = RATE;
 const ENERGY_BIN: usize = RATE / 50;
 const FRAME_BYTES: usize = 4;
 const BOUNDARY_PADDING: f64 = 0.15;
+const TIME_EPSILON: f64 = 0.000_001;
 
 #[derive(Default)]
 pub(super) struct Control {
@@ -53,7 +54,7 @@ pub(super) struct Analysis {
     pub utterances: Vec<Utterance>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Utterance {
     pub speech: Range,
     pub start: Option<f64>,
@@ -340,6 +341,87 @@ pub(super) struct Detected {
 }
 
 impl Detected {
+    pub fn reuse(
+        &self,
+        duration: f64,
+        trim: Option<Range>,
+        lines: &[Utterance],
+        pauses: bool,
+    ) -> Option<Analysis> {
+        let Some(trim) = trim else {
+            return Some(Analysis {
+                pauses: if pauses { self.pauses() } else { Vec::new() },
+                utterances: lines.to_vec(),
+            });
+        };
+        // Only reuse whole speech groups. A clip boundary through a group could
+        // leave words in the transcript that are absent from the edited audio.
+        if trim.start < 0.0 || trim.end > self.duration + TIME_EPSILON {
+            return None;
+        }
+        let is_quiet = |point| {
+            self.quiet
+                .iter()
+                .any(|range| range.start <= point && point <= range.end)
+        };
+        if (trim.start > 0.0 && !is_quiet(trim.start))
+            || (trim.end < self.duration && !is_quiet(trim.end))
+        {
+            return None;
+        }
+        let groups = self.utterance_groups();
+        let first = groups.partition_point(|group| group.end <= trim.start);
+        let end = groups.partition_point(|group| group.start < trim.end);
+        if groups
+            .get(first..end)?
+            .iter()
+            .any(|group| group.start < trim.start || group.end > trim.end)
+        {
+            return None;
+        }
+        let slice = |ranges: &[Range]| {
+            ranges
+                .iter()
+                .filter(|range| range.overlaps(trim))
+                .map(|range| {
+                    Range::new(range.start.max(trim.start), range.end.min(trim.end))
+                        .offset(-trim.start)
+                })
+                .collect()
+        };
+        let detected = Self {
+            duration: self.duration.min(trim.end) - trim.start,
+            speech: slice(&self.speech),
+            quiet: slice(&self.quiet),
+        };
+        Some(Analysis {
+            pauses: if pauses {
+                detected.pauses()
+            } else {
+                Vec::new()
+            },
+            utterances: lines
+                .iter()
+                .filter(|line| (first..end).contains(&line.ordinal))
+                .map(|line| {
+                    let speech = line.speech.offset(-trim.start);
+                    Utterance {
+                        speech,
+                        start: detected.before(speech.start),
+                        end: detected.after(speech.end, duration),
+                        ordinal: line.ordinal - first,
+                        last: line.ordinal + 1 == end,
+                        text: line.text.clone(),
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    pub fn cache_size(&self) -> usize {
+        (self.speech.len() + self.quiet.len()).saturating_mul(80)
+    }
+
     pub fn has_speech(&self) -> bool {
         !self.speech.is_empty()
     }
@@ -374,7 +456,7 @@ impl Detected {
     }
 
     fn before(&self, speech_start: f64) -> Option<f64> {
-        if speech_start <= BOUNDARY_PADDING {
+        if speech_start <= BOUNDARY_PADDING + TIME_EPSILON {
             return Some(0.0);
         }
         self.quiet[..self
@@ -390,7 +472,7 @@ impl Detected {
     }
 
     fn after(&self, speech_end: f64, source_duration: f64) -> Option<f64> {
-        if source_duration - speech_end <= BOUNDARY_PADDING {
+        if source_duration - speech_end <= BOUNDARY_PADDING + TIME_EPSILON {
             return Some(source_duration);
         }
         self.quiet[self.quiet.partition_point(|quiet| quiet.end <= speech_end)..]

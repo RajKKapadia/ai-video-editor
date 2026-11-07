@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::{
     Analysis, MediaInput, Session, TRANSCRIPT_LIMIT, TRANSCRIPT_TOO_LARGE,
     audio::{Engine, PreparedAudio},
+    cache::{Cache, Transcript, linked_key},
     progress, speech,
     worker::Transcriber,
 };
@@ -21,6 +22,7 @@ use super::{
 pub(super) struct Source {
     pub clip_id: String,
     pub input: MediaInput,
+    pub upload_key: Option<String>,
     pub released: Option<oneshot::Sender<()>>,
 }
 
@@ -41,6 +43,16 @@ impl Pipeline {
         let task = tauri::async_runtime::spawn_blocking(move || {
             let transcribing = AtomicBool::new(whisper.is_some());
             let progress = PipelineProgress::new(&app, &session);
+            let cache = Mutex::new(
+                session
+                    .project_id
+                    .as_deref()
+                    .map(|id| Cache::load(&app, id))
+                    .unwrap_or_default(),
+            );
+            let model = selection
+                .as_ref()
+                .map(|selection| selection.model.file().checksum);
             let mut transcriber =
                 whisper
                     .as_deref()
@@ -56,20 +68,39 @@ impl Pipeline {
             std::thread::scope(|scope| {
                 // One range can be prepared while the preceding range is transcribed.
                 let (ready, prepared) = sync_channel(0);
-                let decoder =
-                    scope.spawn(|| decode(incoming, ready, &vad, &progress, &transcribing));
+                let decoder = scope.spawn(|| {
+                    decode(
+                        incoming,
+                        ready,
+                        &vad,
+                        &progress,
+                        &transcribing,
+                        &cache,
+                        model,
+                    )
+                });
                 let result = collect(
                     prepared,
                     &mut transcriber,
                     selection.as_ref(),
                     &progress,
                     &transcribing,
+                    &cache,
+                    model,
                 );
                 let decoded = decoder
                     .join()
                     .map_err(|_| "Local audio preparation stopped unexpectedly.")?;
                 decoded.and(result)
-            })
+            })?;
+            session.control.check()?;
+            if let Some(id) = &session.project_id
+                && cache.into_inner().unwrap().save(&app, id).is_err()
+            {
+                session.data.lock().unwrap().analysis_cache_issue =
+                    Some("Could not save reusable speech analysis in the workspace cache.".into());
+            }
+            Ok(())
         });
         Self { sources, task }
     }
@@ -83,8 +114,14 @@ impl Pipeline {
 }
 
 enum PreparedRange {
-    Decoded(Option<PreparedAudio>),
+    Decoded(Option<PreparedAudio>, Option<Arc<MediaRevision>>),
+    Cached(Analysis, Option<String>),
     Repeated(usize),
+}
+
+struct MediaRevision {
+    key: String,
+    linked: Option<PathBuf>,
 }
 
 fn decode(
@@ -93,6 +130,8 @@ fn decode(
     vad: &Path,
     progress: &PipelineProgress<'_>,
     transcribing: &AtomicBool,
+    cache: &Mutex<Cache>,
+    model: Option<&str>,
 ) -> Result<(), String> {
     let session = progress.session;
     let mut engine = Engine::new(vad)?;
@@ -108,10 +147,20 @@ fn decode(
     while let Some(Source {
         clip_id,
         input,
+        upload_key,
         released,
     }) = sources.blocking_recv()
     {
         let indices = by_source.remove(clip_id.as_str()).unwrap_or_default();
+        let revision = if let Some(key) = upload_key {
+            Some(MediaRevision { key, linked: None })
+        } else {
+            linked_key(input.path()).map(|key| MediaRevision {
+                key,
+                linked: Some(input.path().to_owned()),
+            })
+        }
+        .map(Arc::new);
         let mut seen = HashMap::new();
         for index in indices {
             session.control.check()?;
@@ -121,8 +170,16 @@ fn decode(
                 Entry::Occupied(previous) => PreparedRange::Repeated(*previous.get()),
                 Entry::Vacant(first) => {
                     first.insert(index);
-                    PreparedRange::Decoded(
-                        engine
+                    let cached = revision.as_ref().and_then(|media| {
+                        cache
+                            .lock()
+                            .unwrap()
+                            .find(&media.key, range, model, session.pauses)
+                    });
+                    if let Some((analysis, device)) = cached {
+                        PreparedRange::Cached(analysis, device)
+                    } else {
+                        let audio = engine
                             .prepare(
                                 &session.decoder,
                                 input.path(),
@@ -131,8 +188,9 @@ fn decode(
                                 &session.control,
                                 |fraction| progress.update(|state| state.preparing = fraction),
                             )
-                            .ok(),
-                    )
+                            .ok();
+                        PreparedRange::Decoded(audio, revision.clone())
+                    }
                 }
             };
             session.control.check()?;
@@ -159,6 +217,8 @@ fn collect(
     selection: Option<&speech::Selection>,
     progress: &PipelineProgress<'_>,
     transcribing: &AtomicBool,
+    cache: &Mutex<Cache>,
+    model: Option<&str>,
 ) -> Result<(), String> {
     let session = progress.session;
     let mut results: Vec<Option<Arc<Analysis>>> = vec![None; session.runs.len()];
@@ -166,25 +226,42 @@ fn collect(
     let mut text_bytes = 0;
     let mut issue = None;
     let mut notice = None;
+    let mut devices = HashSet::new();
+    let mut device = selection
+        .and_then(|selection| selection.device.as_ref())
+        .map_or("CPU", |device| device.name.as_str());
     for (index, audio) in prepared {
         session.control.check()?;
         let run = &session.runs[index];
+        let cached = matches!(audio, PreparedRange::Cached(..));
         let result = match audio {
             PreparedRange::Repeated(first) => results[first].clone(),
-            PreparedRange::Decoded(None) => {
+            PreparedRange::Cached(analysis, device) => {
+                devices.extend(device);
+                Some(Arc::new(analysis))
+            }
+            PreparedRange::Decoded(None, _) => {
                 failed.insert(run.clip_id.clone());
                 None
             }
-            PreparedRange::Decoded(Some(audio)) => {
+            PreparedRange::Decoded(Some(audio), revision) => {
                 let mut result = Analysis::default();
+                let mut transcript = None;
                 if session.pauses {
                     result.pauses = audio.detected.pauses();
                 }
-                if let (Some(worker), Some(pcm)) = (transcriber.as_mut(), audio.pcm) {
-                    match worker.transcribe(pcm.path(), audio.detected, run.source.duration()) {
+                if let (Some(worker), Some(pcm), Some(model)) =
+                    (transcriber.as_mut(), audio.pcm, model)
+                {
+                    match worker.transcribe(
+                        pcm.path(),
+                        audio.detected.clone(),
+                        run.source.duration(),
+                    ) {
                         Ok((utterances, fallback)) => {
                             result.utterances = utterances;
                             if fallback {
+                                device = "CPU";
                                 let mut message = "GPU transcription failed. Continued on CPU using the same Whisper model.".to_owned();
                                 if let Some(selection) = selection
                                     && speech::record_gpu_failure(progress.app, selection).is_err()
@@ -195,10 +272,28 @@ fn collect(
                                 }
                                 notice = Some(message);
                             }
+                            devices.insert(device.to_owned());
+                            transcript = Some(Transcript {
+                                model: model.to_owned(),
+                                device: device.to_owned(),
+                                utterances: result.utterances.clone(),
+                            });
                         }
                         Err(error) => issue = Some(error),
                     }
                     session.control.check()?;
+                }
+                if let Some(revision) = revision
+                    && revision.linked.as_ref().is_none_or(|path| {
+                        linked_key(path).as_deref() == Some(revision.key.as_str())
+                    })
+                {
+                    cache.lock().unwrap().record(
+                        revision.key.clone(),
+                        run.source,
+                        audio.detected,
+                        transcript,
+                    );
                 }
                 Some(Arc::new(result))
             }
@@ -218,13 +313,22 @@ fn collect(
             transcribing.store(false, Ordering::Relaxed);
         }
         results[index] = result;
-        progress.update(|state| state.finished += 1);
+        if cached {
+            progress.update_stage("Reusing saved speech analysis", |state| state.finished += 1);
+        } else {
+            progress.update(|state| state.finished += 1);
+        }
     }
     session.control.check()?;
     // The worker is no longer needed during provider requests or cache writes.
     *transcriber = None;
     let mut data = session.data.lock().unwrap();
     data.results = results;
+    data.processing_device = if devices.len() > 1 {
+        Some("Mixed devices".into())
+    } else {
+        devices.into_iter().next()
+    };
     data.failed.extend(failed);
     if let Some(issue) = issue {
         data.retake_issue = Some(issue);
@@ -263,7 +367,7 @@ impl<'a> PipelineProgress<'a> {
             .as_ref()
             .is_some_and(|(stage, _)| *stage == super::assistant::Stage::Cuts)
         {
-            "Transcribing the reviewed timeline"
+            "Analyzing the reviewed timeline"
         } else {
             "Analyzing speech"
         };
@@ -277,11 +381,15 @@ impl<'a> PipelineProgress<'a> {
     }
 
     fn update(&self, update: impl FnOnce(&mut ProgressState)) {
+        self.update_stage(self.stage, update);
+    }
+
+    fn update_stage(&self, stage: &str, update: impl FnOnce(&mut ProgressState)) {
         let mut state = self.state.lock().unwrap();
         update(&mut state);
         let fraction = (0.35 * (state.prepared as f64 + state.preparing)
             + 0.65 * state.finished as f64)
             / self.total;
-        progress(self.app, &self.session.id, self.stage, Some(fraction));
+        progress(self.app, &self.session.id, stage, Some(fraction));
     }
 }

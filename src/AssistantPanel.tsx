@@ -128,12 +128,12 @@ export function AssistantPanel({
                   </button>
                 )}
                 {needsCuts && (
-                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Transcribe the reviewed timeline again and suggest cuts.')}>
-                    Transcribe and find cuts
+                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Suggest cuts for the reviewed timeline.')}>
+                    Find cuts
                   </button>
                 )}
                 {reviewingPauses && (
-                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Keep the pauses as they are. Transcribe the reviewed timeline and suggest cuts.')}>
+                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Keep the pauses as they are and suggest cuts for the reviewed timeline.')}>
                     Find cuts without removing pauses
                   </button>
                 )}
@@ -163,7 +163,7 @@ export function AssistantPanel({
               reviewingPauses={reviewingPauses}
               canApply={!reviewingPauses || canRun}
               onApply={reviewingPauses
-                ? () => submit('cuts', 'I applied the selected pause removals. Transcribe the edited timeline and suggest cuts.', true)
+                ? () => submit('cuts', 'I applied the selected pause removals. Suggest cuts for the edited timeline.', true)
                 : review.onApply}
             />
           </>
