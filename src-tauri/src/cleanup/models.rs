@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 pub(super) struct Model {
     pub(super) name: &'static str,
     url: &'static str,
-    checksum: &'static str,
+    pub(super) checksum: &'static str,
     max_bytes: u64,
 }
 

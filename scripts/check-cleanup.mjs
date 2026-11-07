@@ -18,10 +18,19 @@ async function click(text) {
   await waitFor('(() => { const button = ' + button + '; if (!button) return false; button.click(); return true; })()');
 }
 const savedTimeline = () => evaluate("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline");
+const savedDraft = () => evaluate("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].cleanupDraft");
 const openCleanup = async () => {
-  await click('Clean up timeline');
+  if (!await evaluate("!!document.querySelector('.cleanup-options')")) await click('Clean up timeline');
   await waitFor("document.querySelectorAll('.cleanup-options input').length === 2");
 };
+async function reloadReview(panel, count, checked) {
+  await evaluate('window.reloadingCleanupCheck = true');
+  await browser.send('Page.reload');
+  await waitFor("!window.reloadingCleanupCheck && document.querySelector(" + JSON.stringify(panel) + ") && document.querySelectorAll('.cleanup-results li').length === " + count);
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), checked);
+  assert.equal(await evaluate("document.querySelector('.stage-label').textContent.includes('CLEANUP PREVIEW')"), false);
+  assert.equal(await evaluate("cleanupCalls.includes('cleanup_begin')"), false);
+}
 let scriptId;
 
 try {
@@ -72,8 +81,9 @@ try {
               transcriptCacheIssue: null,
               retakeIssue: mode === "partial" ? "The AI provider timed out." : null,
               ...(stage === "draft" && { draftSummary: "Review the proposed edits." }),
+              ...(stage === "draft" && mode === "quiet" && { canClearTimeline: true }),
               ...(stage === "chat" && { assistantTurn: [{ id: 1, role: "assistant", text: "Transcript answer" }] }),
-              proposals: stage === "draft" ? (
+              proposals: stage === "draft" && mode === "quiet" ? [{ ...pause, remove: { start: 0, end: 4 } }] : stage === "draft" ? (
                 mode === "invalid" ? [{ ...pause, remove: { start: .01, end: 1.3 } }] :
                 mode === "empty" ? [] : [pause, retake]
               ) : stage === "chat" ? [] : stage === "cuts" ? [retake] :
@@ -112,7 +122,16 @@ try {
   await click('Play kept take');
   await waitFor("Number(document.querySelector('[aria-label=\"Viewer playhead\"]').value) >= .29");
   await waitFor("document.querySelector('video').paused");
+  await click('Select all retakes');
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 1);
   await click('Select all pauses');
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 2);
+  await click('Clear selection');
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 0);
+  await click('Select all pauses');
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].cleanupDraft?.checked.length === 1");
+  await reloadReview('.cleanup-options', 2, 1);
+  assert.deepEqual(await savedTimeline(), before);
   await click('Preview join');
   await waitFor("document.querySelector('.stage-label').textContent.includes('CLEANUP PREVIEW')");
   await waitFor("document.querySelector('video').currentTime >= 1.3");
@@ -120,18 +139,29 @@ try {
   const previewLength = await evaluate("document.querySelector('[aria-label=\"Viewer playhead\"]').max");
 
   await click('Apply selected');
-  await waitFor("!document.querySelector('.cleanup-panel')");
+  await waitFor("document.querySelectorAll('.cleanup-results li').length === 1");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Viewer playhead\"]').max"), previewLength);
   assert.equal((await savedTimeline()).length, 3);
   assert.deepEqual((await savedTimeline()).map((item) => [item.in, item.out]), [[0, .55], [1.3, 2], [0, 2]]);
+  assert.ok(Math.abs((await savedDraft()).review.report.proposals[0].remove.start - 1.65) < .00001);
+  await click('Select all retakes');
+  await click('Apply selected');
+  await waitFor("!document.querySelector('.cleanup-panel')");
+  assert.deepEqual((await savedTimeline()).map(({ in: start, out }) => [start, out].map(time => Number(time.toFixed(3)))), [[0, .55], [1.3, 2], [0, .4], [1.2, 2]]);
+  assert.equal(await savedDraft(), undefined);
+  await evaluate("document.querySelector('[aria-label=\"Undo timeline edit\"]').click()");
+  await openCleanup();
+  await waitFor("document.querySelectorAll('.cleanup-results li').length === 1");
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 1);
   await evaluate("document.querySelector('[aria-label=\"Undo timeline edit\"]').click()");
   await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline[0].id === 'take-a'");
   assert.deepEqual(await savedTimeline(), before);
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 1);
 
   await openCleanup();
   await evaluate("cleanupMock.mode = 'partial'; document.querySelectorAll('.cleanup-options input')[1].click()");
   await waitFor("document.querySelector('.cleanup-panel').textContent.includes('test-model')");
-  await click('Analyze timeline');
+  await click('Analyze again');
   await waitFor("document.querySelector('.cleanup-panel').textContent.includes('The AI provider timed out.')");
   assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 1);
   await click('Select all pauses');
@@ -152,7 +182,7 @@ try {
   await waitFor("document.querySelector('.cleanup-panel').textContent.includes('The timeline changed.')");
   await waitFor("cleanupCalls.includes('cleanup_cancel') && !document.querySelector('.cleanup-progress')");
   assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 0);
-  console.log('Cleanup review, audition, join preview, apply, undo, reopening, provider fallback, and stale analysis passed.');
+  console.log('Cleanup bulk selection, saved drafts, partial apply, audition, join preview, Undo, provider fallback, and stale analysis passed.');
 
   // Restore the original two takes in the disposable profile.
   await evaluate("(() => {const snapshot = JSON.parse(sessionStorage.getItem('mockProjectCache'));" +
@@ -169,9 +199,29 @@ try {
   assert.equal(await evaluate("assistantRequests[0].stage"), 'draft');
   assert.match(await evaluate("assistantRequests[0].message"), /Preserve unique details/);
   assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 0);
+  await click('Select all pauses');
+  await click('Select all retakes');
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 2);
+  await click('Clear selection');
+  await click('Select all retakes');
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].cleanupDraft?.checked[0] === 1");
+  await click('Preview selected');
+  await reloadReview('.assistant-panel', 2, 1);
+  assert.deepEqual(await savedTimeline(), before);
+  await evaluate("cleanupMock.mode = 'unavailable'");
+  await click('Draft cleanup');
+  await waitFor("document.querySelector('.assistant-panel')?.textContent.includes('Some timeline sources could not be analyzed.')");
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 2);
+  assert.deepEqual((await savedDraft()).checked, [1]);
+  await evaluate("cleanupMock.mode = 'stale'");
+  await click('Draft cleanup');
+  await click('Cancel analysis');
+  await waitFor("!document.querySelector('.cleanup-progress')");
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 2);
+  assert.deepEqual((await savedDraft()).checked, [1]);
+  await evaluate("cleanupMock.mode = 'success'");
   await click('Play kept take');
   await waitFor("document.querySelector('video').currentTime >= .25 && document.querySelector('video').paused");
-  await evaluate("document.querySelectorAll('.cleanup-results input')[1].click()");
   await click('Preview join');
   await waitFor("document.querySelector('.stage-label').textContent.includes('CLEANUP PREVIEW')");
   assert.deepEqual(await savedTimeline(), before);
@@ -183,7 +233,7 @@ try {
   assert.deepEqual(await savedTimeline(), before);
 
   for (const [mode, message] of [
-    ['invalid', 'could not be applied safely'],
+    ['invalid', 'fragment shorter than one frame'],
     ['unavailable', 'sources could not be analyzed'],
     ['empty', 'No cuts suggested'],
   ]) {
@@ -193,6 +243,24 @@ try {
     assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 0);
     assert.deepEqual(await savedTimeline(), before);
   }
+
+  await evaluate("cleanupMock.mode = 'partial'");
+  await click('Draft cleanup');
+  await waitFor("document.querySelector('.assistant-panel')?.textContent.includes('The AI provider timed out.')");
+  assert.equal(await evaluate("document.querySelectorAll('.cleanup-results li').length"), 2);
+  assert.deepEqual(await savedTimeline(), before);
+
+  await evaluate("cleanupMock.mode = 'quiet'");
+  await click('Draft cleanup');
+  await waitFor("document.querySelector('.assistant-panel')?.textContent.includes('clear the timeline')");
+  await evaluate("document.querySelector('.cleanup-results input').click()");
+  await click('Preview selected');
+  assert.deepEqual(await savedTimeline(), before);
+  await click('Apply selected');
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 0");
+  await evaluate("document.querySelector('[aria-label=\"Undo timeline edit\"]').click()");
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 2");
+  assert.deepEqual(await savedTimeline(), before);
 
   async function removeTimelineSegment() {
     await evaluate("document.querySelector('.timeline-segment.video').click()");

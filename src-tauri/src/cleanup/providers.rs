@@ -340,7 +340,7 @@ pub(crate) async fn ai_provider_test(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UtteranceRange {
     pub first: u32,
@@ -394,6 +394,7 @@ IDs, inclusive, and a keep must never also be removed. Return only JSON in the f
 {\"retakes\":[{\"keep\":{\"first\":1,\"last\":1},\"remove\":{\"first\":2,\"last\":2}}]}. \
 Return {\"retakes\":[]} if there are no confident matches.";
 
+#[derive(Clone)]
 pub(super) struct Task<'a> {
     pub name: &'static str,
     pub instructions: &'a str,
@@ -401,6 +402,40 @@ pub(super) struct Task<'a> {
 }
 
 impl Connection {
+    #[cfg(test)]
+    pub(in crate::cleanup) fn configured_for_test(path: &Path) -> Result<Self, String> {
+        let settings = load(path)?;
+        let provider = settings
+            .active
+            .ok_or("Choose an AI provider in the desktop settings.")?;
+        let mut config = settings
+            .profiles
+            .get(&provider)
+            .ok_or("No saved provider profile.")?
+            .clone();
+        if std::env::var("CUTLINE_REVIEW_EXPECT_PROVIDER")
+            .is_ok_and(|expected| expected != provider.account())
+            || std::env::var("CUTLINE_REVIEW_EXPECT_MODEL")
+                .is_ok_and(|expected| expected != config.model)
+        {
+            return Err("The saved provider or model changed. Review the destination before running this verification.".into());
+        }
+        config.validate(provider)?;
+        let key = if config.needs_key(provider) {
+            config.key(provider)?
+        } else {
+            config.key(provider).ok().flatten()
+        };
+        if key.is_none() && config.needs_key(provider) {
+            return Err("No API key is available in the credential store.".into());
+        }
+        Ok(Self {
+            provider,
+            config,
+            key,
+        })
+    }
+
     fn request(&self, client: &Client, input: &str, task: Task<'_>) -> reqwest::RequestBuilder {
         let model = &self.config.model;
         let Task {
@@ -498,32 +533,37 @@ impl Connection {
         let client = builder
             .build()
             .map_err(|_| "Could not initialize the AI provider connection.")?;
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err("Timeline analysis cancelled.".into()),
-            result = self.send(&client, input, task) => result,
-        }
+        retry(|| self.send(&client, input, task.clone()), cancel).await
     }
 
-    async fn send(&self, client: &Client, input: &str, task: Task<'_>) -> Result<String, String> {
+    async fn send(
+        &self,
+        client: &Client,
+        input: &str,
+        task: Task<'_>,
+    ) -> Result<String, ProviderFailure> {
         let mut response = self
             .request(client, input, task)
             .send()
             .await
-            .map_err(|error| {
-                if error.is_timeout() {
+            .map_err(|error| ProviderFailure {
+                message: if error.is_timeout() {
                     "The AI provider timed out."
                 } else {
                     "Could not connect to the AI provider."
                 }
+                .into(),
+                transient: error.is_timeout() || error.is_connect(),
+                retry_after: None,
             })?;
         let status = response.status();
+        let retry_after_header = response.headers().get("retry-after").cloned();
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| "The AI provider response was interrupted.")?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|_| ProviderFailure {
+            message: "The AI provider response was interrupted.".into(),
+            transient: true,
+            retry_after: None,
+        })? {
             if bytes.len() + chunk.len() > MAX_REPLY_BYTES {
                 return Err("The AI provider returned an oversized response.".into());
             }
@@ -531,7 +571,7 @@ impl Connection {
         }
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-            return Err(match status.as_u16() {
+            let message = match status.as_u16() {
                 401 | 403 => "The AI provider rejected the API key or model access.".into(),
                 413 => "The selected model cannot fit this timeline transcript.".into(),
                 400 | 422
@@ -549,14 +589,106 @@ impl Connection {
                 }
                 429 => "The AI provider reached a rate or quota limit.".into(),
                 404 => "The model or API endpoint was not found.".into(),
+                code if status.is_server_error() => {
+                    format!("The AI provider is temporarily unavailable (HTTP {code}).")
+                }
                 code => format!(
                     "The AI provider rejected the request (HTTP {code}). Check the model and provider settings."
                 ),
+            };
+            let retry_after = retry_after_header
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<f64>().ok())
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+            // An unsupported Retry-After date is not a license to retry earlier.
+            let understood_delay = retry_after_header.is_none() || retry_after.is_some();
+            return Err(ProviderFailure {
+                message,
+                transient: understood_delay && retryable_status(status.as_u16(), &bytes),
+                retry_after,
             });
         }
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "The AI provider returned an invalid response.")?;
-        reply_text(self.provider, &value).map(str::to_owned)
+        reply_text(self.provider, &value)
+            .map(str::to_owned)
+            .map_err(ProviderFailure::from)
+    }
+}
+
+#[derive(Debug)]
+struct ProviderFailure {
+    message: String,
+    transient: bool,
+    retry_after: Option<Duration>,
+}
+
+impl From<&str> for ProviderFailure {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+            retry_after: None,
+        }
+    }
+}
+
+impl From<String> for ProviderFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            transient: false,
+            retry_after: None,
+        }
+    }
+}
+
+fn retryable_status(status: u16, body: &[u8]) -> bool {
+    if matches!(status, 408 | 409 | 500..=599) {
+        return true;
+    }
+    if status != 429 {
+        return false;
+    }
+    let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let code = value["error"]["code"].as_str().unwrap_or_default();
+    matches!(code, "rate_limit_exceeded" | "slow_down")
+        || (code.is_empty() && value["error"]["type"] == "rate_limit_error")
+}
+
+async fn retry<F, Fut>(mut operation: F, cancel: &CancellationToken) -> Result<String, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, ProviderFailure>>,
+{
+    let work = async {
+        for attempt in 0..3_u32 {
+            match operation().await {
+                Ok(reply) => return Ok(reply),
+                Err(failure) if failure.transient && attempt < 2 => {
+                    let jitter = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_millis()
+                        % 200;
+                    let delay = failure.retry_after.unwrap_or(Duration::from_millis(
+                        500 * 2_u64.pow(attempt) + jitter as u64,
+                    ));
+                    if delay > Duration::from_secs(30) {
+                        return Err(failure.message);
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                Err(failure) => return Err(failure.message),
+            }
+        }
+        unreachable!("bounded provider retry loop always returns")
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("Timeline analysis cancelled.".into()),
+        result = work => result,
     }
 }
 
@@ -611,6 +743,110 @@ fn parse_retakes(text: &str) -> Result<Vec<Retake>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_temporary_failures_but_not_authentication_or_billing_limits() {
+        assert!(retryable_status(500, b"{}"));
+        assert!(retryable_status(503, b"{}"));
+        assert!(retryable_status(
+            429,
+            br#"{"error":{"code":"rate_limit_exceeded"}}"#
+        ));
+        assert!(!retryable_status(
+            429,
+            br#"{"error":{"code":"insufficient_quota"}}"#
+        ));
+        assert!(!retryable_status(
+            429,
+            br#"{"error":{"code":"project_spend_limit_exceeded"}}"#
+        ));
+        assert!(!retryable_status(401, b"{}"));
+        assert!(!retryable_status(413, b"{}"));
+    }
+
+    #[tokio::test]
+    async fn temporary_provider_errors_have_a_bounded_retry_budget() {
+        let mut calls = 0;
+        let reply = retry(
+            || {
+                calls += 1;
+                std::future::ready(if calls < 3 {
+                    Err(ProviderFailure {
+                        message: "temporary".into(),
+                        transient: true,
+                        retry_after: Some(Duration::ZERO),
+                    })
+                } else {
+                    Ok("recovered".into())
+                })
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, "recovered");
+        assert_eq!(calls, 3);
+        calls = 0;
+        let result = retry(
+            || {
+                calls += 1;
+                std::future::ready(Err(ProviderFailure {
+                    message: "still unavailable".into(),
+                    transient: true,
+                    retry_after: Some(Duration::ZERO),
+                }))
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(result.unwrap_err(), "still unavailable");
+    }
+
+    #[tokio::test]
+    async fn retry_waits_remain_cancellable_and_never_shorten_a_long_retry_after() {
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            signal.cancel();
+        });
+        let mut calls = 0;
+        let reply = tokio::time::timeout(
+            Duration::from_millis(200),
+            retry(
+                || {
+                    calls += 1;
+                    std::future::ready(Err(ProviderFailure {
+                        message: "temporary".into(),
+                        transient: true,
+                        retry_after: Some(Duration::from_secs(20)),
+                    }))
+                },
+                &cancel,
+            ),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+        assert_eq!(calls, 1);
+        assert!(reply.unwrap_err().contains("cancelled"));
+        calls = 0;
+        let result = retry(
+            || {
+                calls += 1;
+                std::future::ready(Err(ProviderFailure {
+                    message: "Retry later".into(),
+                    transient: true,
+                    retry_after: Some(Duration::from_secs(60)),
+                }))
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert_eq!(result.unwrap_err(), "Retry later");
+    }
 
     fn parse_reply(provider: Provider, value: &Value) -> Result<Vec<Retake>, String> {
         parse_retakes(reply_text(provider, value)?)

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { canPreviewCleanupDraft, makeCleanupEdit, type CleanupReport } from '../src/cleanupTimeline';
+import { canPreviewCleanupDraft, makeCleanupEdit, prepareCleanupReview, type CleanupReport } from '../src/cleanupTimeline';
 import { sequenceLength, type Segment } from '../src/types';
 
 const original: Segment[] = [
@@ -38,6 +38,14 @@ describe('cleanup timeline', () => {
     expect(makeCleanupEdit(original, [{ start: NaN, end: 2 }])).toBeNull();
   });
 
+  test('can clear a sequence only when the backend verified that all source audio is quiet', () => {
+    expect(makeCleanupEdit(original, [{ start: 0, end: 11 }])).toBeNull();
+    const cleared = makeCleanupEdit(original, [{ start: 0, end: 11 }], true)!;
+    expect(cleared.timeline).toEqual([]);
+    expect(cleared.secondsRemoved).toBe(11);
+    expect(cleared.mapTime(7)).toBe(0);
+  });
+
   test('rejects a draft that only creates a sub-frame fragment when cuts are combined', () => {
     const report: CleanupReport = {
       draftSummary: 'Draft', failedSources: 0, retakeIssue: null, transcriptCacheIssue: null,
@@ -47,5 +55,22 @@ describe('cleanup timeline', () => {
     };
     expect(canPreviewCleanupDraft(original, { ...report, proposals: report.proposals.slice(0, 1) })).toBe(true);
     expect(canPreviewCleanupDraft(original, report)).toBe(false);
+    const reviewed = prepareCleanupReview(original, report);
+    expect(reviewed.proposals).toEqual([]);
+    expect(reviewed.reviewNotes?.length).toBe(1);
+    expect(canPreviewCleanupDraft(original, reviewed)).toBe(true);
+  });
+
+  test('retains independent valid cuts and explains invalid frame boundaries', () => {
+    const report: CleanupReport = {
+      draftSummary: 'Draft', failedSources: 1, retakeIssue: 'Provider unavailable', transcriptCacheIssue: null,
+      proposals: [{ start: 0.01, end: 1 }, { start: 2, end: 3 }].map((remove) => ({
+        kind: 'cut', remove, keep: null, keptText: null, removedText: null,
+      })),
+    };
+    const reviewed = prepareCleanupReview(original, report);
+    expect(reviewed.proposals.map(({ remove }) => remove)).toEqual([{ start: 2, end: 3 }]);
+    expect(reviewed.reviewNotes?.length).toBe(1);
+    expect(canPreviewCleanupDraft(original, reviewed)).toBe(true);
   });
 });
