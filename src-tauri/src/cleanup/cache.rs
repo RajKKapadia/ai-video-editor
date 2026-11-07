@@ -21,6 +21,11 @@ use super::{
 const VERSION: u32 = 1;
 const MAX_RANGES: usize = 1024;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+const TIME_EPSILON: f64 = 0.000_001;
+
+fn same_range(left: Range, right: Range) -> bool {
+    (left.start - right.start).abs() <= TIME_EPSILON && (left.end - right.end).abs() <= TIME_EPSILON
+}
 
 pub(super) fn linked_key(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
@@ -54,7 +59,11 @@ pub(super) struct Transcript {
     pub model: String,
     pub device: String,
     pub utterances: Vec<Utterance>,
+    #[serde(default)]
+    pub alignment_version: u32,
 }
+
+pub(super) const ALIGNMENT_VERSION: u32 = 2;
 
 impl Recording {
     fn size(&self) -> usize {
@@ -64,7 +73,14 @@ impl Recording {
                 transcript
                     .utterances
                     .iter()
-                    .map(|line| 320 + 6 * line.text.len())
+                    .map(|line| {
+                        320 + 6 * line.text.len()
+                            + line
+                                .words
+                                .iter()
+                                .map(|word| 256 + 6 * word.text.len())
+                                .sum::<usize>()
+                    })
                     .sum()
             })
     }
@@ -95,19 +111,23 @@ impl Default for Cache {
 impl Cache {
     pub fn load(app: &AppHandle, project_id: &str) -> Self {
         with_project_cache(app, project_id, |folder| {
-            let file = File::open(folder.join(format!("speech-analysis-{project_id}.json")))
-                .map_err(|error| error.to_string())?;
-            serde_json::from_reader::<_, Self>(BufReader::new(file.take(MAX_BYTES as u64)))
-                .map_err(|error| error.to_string())
+            Self::read(&folder.join(format!("speech-analysis-{project_id}.json")))
+                .ok_or_else(|| "No compatible speech analysis cache.".to_owned())
         })
         .ok()
-        .filter(|cache| {
-            cache.version == VERSION
-                && cache.engine == whisper_rs::WHISPER_CPP_VERSION
-                && cache.vad == VAD.checksum
-                && cache.recordings.len() <= MAX_RANGES
-        })
         .unwrap_or_default()
+    }
+
+    pub(super) fn read(path: &Path) -> Option<Self> {
+        let file = File::open(path).ok()?;
+        serde_json::from_reader::<_, Self>(BufReader::new(file.take(MAX_BYTES as u64)))
+            .ok()
+            .filter(|cache| {
+                cache.version == VERSION
+                    && cache.engine == whisper_rs::WHISPER_CPP_VERSION
+                    && cache.vad == VAD.checksum
+                    && cache.recordings.len() <= MAX_RANGES
+            })
     }
 
     pub fn save(&self, app: &AppHandle, project_id: &str) -> Result<(), String> {
@@ -132,22 +152,22 @@ impl Cache {
     ) -> Option<(Analysis, Option<String>)> {
         let candidates = self.recordings.iter().rev().filter(|entry| {
             entry.media == media
-                && entry.range.start <= range.start
-                && entry.range.end >= range.end
+                && entry.range.start <= range.start + TIME_EPSILON
+                && entry.range.end + TIME_EPSILON >= range.end
                 && model.is_none_or(|model| {
-                    entry
-                        .transcript
-                        .as_ref()
-                        .is_some_and(|text| text.model == model)
+                    entry.transcript.as_ref().is_some_and(|text| {
+                        text.model == model && text.alignment_version == ALIGNMENT_VERSION
+                    })
                 })
         });
         candidates
             .clone()
-            .filter(|entry| entry.range == range)
-            .chain(candidates.filter(|entry| entry.range != range))
+            .filter(|entry| same_range(entry.range, range))
+            .chain(candidates.filter(|entry| !same_range(entry.range, range)))
             .find_map(|entry| {
                 let transcript = entry.transcript.as_ref().filter(|_| model.is_some());
-                let trim = (entry.range != range).then(|| range.offset(-entry.range.start));
+                let trim =
+                    (!same_range(entry.range, range)).then(|| range.offset(-entry.range.start));
                 entry
                     .detected
                     .reuse(
@@ -224,6 +244,7 @@ mod tests {
             detected,
             Some(Transcript {
                 model: "model".into(),
+                alignment_version: ALIGNMENT_VERSION,
                 device: "CPU".into(),
                 utterances: [(1.0, "First line"), (4.0, "Second line")]
                     .into_iter()
@@ -235,6 +256,7 @@ mod tests {
                         ordinal,
                         last: ordinal == 1,
                         text: text.into(),
+                        words: Vec::new(),
                     })
                     .collect(),
             }),
@@ -243,12 +265,29 @@ mod tests {
         let (original, _) = cache
             .find("media", Range::new(10.0, 16.0), Some("model"), true)
             .unwrap();
-        assert_eq!(original.pauses, vec![Range::new(2.15, 3.85)]);
+        assert_eq!(
+            original.pauses,
+            vec![
+                Range::new(0.0, 0.85),
+                Range::new(2.15, 3.85),
+                Range::new(5.15, 6.0),
+            ]
+        );
         let (silence_only, _) = cache
             .find("media", Range::new(10.0, 16.0), None, true)
             .unwrap();
         assert!(silence_only.utterances.is_empty());
         assert_eq!(silence_only.pauses, original.pauses);
+        let (rounded, _) = cache
+            .find(
+                "media",
+                Range::new(10.0, 16.0 + 0.000_000_1),
+                Some("model"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(rounded.utterances.len(), original.utterances.len());
+        assert_eq!(rounded.utterances[0].text, original.utterances[0].text);
 
         let runs = [
             Run {
@@ -270,7 +309,7 @@ mod tests {
                 let (analysis, _) = cache
                     .find("media", run.source, Some("model"), true)
                     .unwrap();
-                assert!(analysis.pauses.is_empty());
+                assert_eq!(analysis.pauses.len(), 1);
                 assert_eq!(analysis.utterances[0].ordinal, 0);
                 assert!(analysis.utterances[0].last);
                 Some(Arc::new(analysis))

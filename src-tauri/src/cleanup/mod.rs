@@ -4,6 +4,8 @@ mod cache;
 mod models;
 mod pipeline;
 pub(crate) mod providers;
+#[cfg(test)]
+mod reliability;
 pub(crate) mod speech;
 pub(crate) mod worker;
 
@@ -28,13 +30,15 @@ use crate::project_cache::{MediaInput, approved_media, store_transcript};
 
 use audio::{Analysis, Control};
 use pipeline::{Pipeline, Source};
-use providers::{Config, Connection, Provider, Retake, UtteranceRange};
+use providers::{Config, Connection, Provider, UtteranceRange};
 
 const CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const TRANSCRIPT_LIMIT: usize = 48 * 1024;
 const TRANSCRIPT_TOO_LARGE: &str =
     "The timeline transcript exceeds 48 KiB. Use a shorter sequence for transcript analysis.";
+const LOCAL_TRANSCRIPT_LIMIT: usize = 4 * 1024 * 1024;
+const LOCAL_TRANSCRIPT_TOO_LARGE: &str = "The local transcript exceeds the 4 MiB analysis limit. Split this recording into smaller projects.";
 
 pub(crate) struct CleanupJobs {
     active: Mutex<Option<Arc<Session>>>,
@@ -97,7 +101,7 @@ impl Range {
     }
 
     fn overlaps(self, other: Self) -> bool {
-        self.start < other.end && other.start < self.end
+        self.start < other.end - 0.000_001 && other.start < self.end - 0.000_001
     }
 }
 
@@ -310,7 +314,7 @@ async fn setup(
     provider: Option<ProviderSelection>,
 ) -> Result<(), String> {
     let cancel = &session.control.cancel;
-    let allow_pause_only = session.pauses && session.assistant.is_none();
+    let allow_pause_only = session.pauses;
     let mut retake_issue = None;
     let mut connection = if let Some(selection) = provider {
         match providers::connection(app.clone(), selection.provider, selection.config).await {
@@ -573,6 +577,8 @@ pub(crate) struct Report {
     assistant_turn: Option<Vec<assistant::Message>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     draft_summary: Option<String>,
+    review_notes: Vec<String>,
+    can_clear_timeline: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -660,18 +666,15 @@ async fn proposals(
         runtime_notice,
         assistant_turn: None,
         draft_summary: None,
+        review_notes: Vec::new(),
+        can_clear_timeline: false,
     };
     let drafting = session
         .assistant
         .as_ref()
         .is_some_and(|(stage, _)| *stage == assistant::Stage::Draft);
-    if drafting {
-        if let Some(issue) = report.retake_issue {
-            return Err(issue);
-        }
-        if failed_sources != 0 {
-            return Err("Some timeline sources could not be analyzed. Restore the media or check its audio, then run Draft cleanup again.".into());
-        }
+    if failed_sources != 0 {
+        report.review_notes.push("Analysis is incomplete. Unavailable sources were left unchanged; restore their media and analyze again to finish cleanup.".into());
     }
     let candidates: Vec<_> = session
         .runs
@@ -685,6 +688,18 @@ async fn proposals(
                 .map(move |range| (index, range.offset(run.timeline_start)))
         })
         .collect();
+    let duration = session
+        .runs
+        .last()
+        .map_or(0.0, |run| run.timeline_start + run.source.duration());
+    let mut quiet_coverage = 0.0_f64;
+    for (_, range) in &candidates {
+        if range.start <= quiet_coverage + 0.000_001 {
+            quiet_coverage = quiet_coverage.max(range.end);
+        }
+    }
+    report.can_clear_timeline =
+        failed_sources == 0 && duration > 0.0 && quiet_coverage >= duration - 0.000_001;
     if session.assistant.is_none() {
         report
             .proposals
@@ -735,14 +750,17 @@ async fn proposals(
     }
     session.control.check()?;
     if let Some((stage, message)) = &session.assistant {
-        if let Some(issue) = report.retake_issue {
-            return Err(issue);
+        if matches!(stage, assistant::Stage::Draft | assistant::Stage::Pauses)
+            && (report.retake_issue.is_some() || connection.is_none() || utterances.is_empty())
+        {
+            local_pause_review(&mut report, &candidates);
+            return Ok(report);
         }
         let transcript = transcript
             .filter(|transcript| !transcript.utterances.is_empty())
             .ok_or("No speech was transcribed from the current timeline.")?;
         let connection = connection.ok_or("The assistant’s AI provider is unavailable.")?;
-        let gaps = assistant::transcript_gaps(candidates, &utterances);
+        let gaps = assistant::transcript_gaps(candidates.iter().copied(), &utterances);
         progress(app, &session.id, stage.progress(), None);
         if drafting {
             let draft = assistant::draft::run(
@@ -752,13 +770,22 @@ async fn proposals(
                 &gaps,
                 &session.control.cancel,
             )
-            .await?;
+            .await;
             session.control.check()?;
+            let draft = match draft {
+                Ok(draft) => draft,
+                Err(error) => {
+                    report.retake_issue = Some(error);
+                    local_pause_review(&mut report, &candidates);
+                    return Ok(report);
+                }
+            };
             report.proposals = draft.proposals;
             report.draft_summary = Some(draft.summary);
+            report.review_notes.extend(draft.notes);
             return Ok(report);
         }
-        let (proposals, turn) = assistant::review(
+        let reviewed = assistant::review(
             app,
             session,
             &connection,
@@ -766,14 +793,25 @@ async fn proposals(
             &utterances,
             &gaps,
         )
-        .await?;
+        .await;
+        session.control.check()?;
+        let (proposals, turn, notes) = match reviewed {
+            Ok(reviewed) => reviewed,
+            Err(error) if session.pauses => {
+                report.retake_issue = Some(error);
+                local_pause_review(&mut report, &candidates);
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
         report.proposals = proposals;
         report.assistant_turn = Some(turn);
+        report.review_notes.extend(notes);
         session.control.check()?;
         return Ok(report);
     }
     if let Some(connection) = connection
-        && utterances.len() >= 2
+        && !utterances.is_empty()
     {
         progress(
             app,
@@ -782,7 +820,10 @@ async fn proposals(
             None,
         );
         match retake_proposals(&connection, &utterances, &session.control.cancel).await {
-            Ok(proposals) => report.proposals.extend(proposals),
+            Ok(draft) => {
+                report.proposals.extend(draft.proposals);
+                report.review_notes.extend(draft.notes);
+            }
             Err(error) => report.retake_issue = Some(error),
         }
     }
@@ -791,6 +832,29 @@ async fn proposals(
         .proposals
         .sort_by(|left, right| left.remove.start.total_cmp(&right.remove.start));
     Ok(report)
+}
+
+fn local_pause_review(report: &mut Report, candidates: &[(usize, Range)]) {
+    report.proposals = candidates
+        .iter()
+        .map(|(_, range)| Proposal {
+            kind: "pause",
+            remove: *range,
+            keep: None,
+            removed_text: None,
+            kept_text: None,
+            reason: Some(
+                "Measured quiet audio. Review whether this is an intentional wait before applying."
+                    .into(),
+            ),
+        })
+        .collect();
+    report.draft_summary = Some(if report.can_clear_timeline {
+        "The analyzed sequence contains only measured quiet audio. Applying these removals clears the timeline; Undo restores it.".into()
+    } else {
+        "Quiet gaps are available for manual review. Repeated material and the purpose of these pauses were not fully checked.".into()
+    });
+    report.review_notes.push("These are local audio measurements. No contextual decision was made about intentional pauses or repeated takes.".into());
 }
 
 async fn save_transcript(
@@ -817,19 +881,21 @@ async fn retake_proposals(
     connection: &Connection,
     utterances: &[TimelineUtterance<'_>],
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<Proposal>, String> {
-    let transcript = serde_json::to_string(
-        &utterances
-            .iter()
-            .enumerate()
-            .map(|(index, item)| (index + 1, item.text))
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|_| "Could not prepare the local transcript.")?;
-    let retakes = connection.analyze(&transcript, cancel).await?;
-    Ok(safe_retakes(retakes, utterances))
+) -> Result<assistant::draft::Draft, String> {
+    let mut draft = assistant::draft::run(
+        connection,
+        "Find repeated takes and repeated phrases, including repetitions inside a single utterance. Remove only redundant versions, using kind retake with the kept version identified. Choose the clearest complete version and retain all unique information and intentional repetitions. Do not remove unrelated recording chatter, false starts without a repeated version, or quiet gaps in this operation.",
+        utterances, &[], cancel,
+    ).await?;
+    let count = draft.proposals.len();
+    draft.proposals.retain(|proposal| proposal.kind == "retake");
+    if draft.proposals.len() < count {
+        draft.notes.push("Some suggestions were not repeated takes and were left unchanged. Use Draft cleanup to review false starts and recording chatter as well.".into());
+    }
+    Ok(draft)
 }
 
+#[derive(Clone)]
 struct TimelineUtterance<'a> {
     run: usize,
     ordinal: usize,
@@ -838,6 +904,7 @@ struct TimelineUtterance<'a> {
     cut_start: Option<f64>,
     cut_end: Option<f64>,
     text: &'a str,
+    words: Vec<audio::Word>,
 }
 
 fn ordered_utterances<'a>(
@@ -859,6 +926,15 @@ fn ordered_utterances<'a>(
                     cut_start: utterance.start.map(|time| run.timeline_start + time),
                     cut_end: utterance.end.map(|time| run.timeline_start + time),
                     text: &utterance.text,
+                    words: utterance
+                        .words
+                        .iter()
+                        .map(|word| audio::Word {
+                            speech: word.speech.offset(run.timeline_start),
+                            text: word.text.clone(),
+                            anchor: word.anchor.map(|range| range.offset(run.timeline_start)),
+                        })
+                        .collect(),
                 })
         })
         .collect()
@@ -878,66 +954,12 @@ fn resolve<'a, 'b>(
         .all(|pair| {
             let [left, right] = [&pair[0], &pair[1]];
             if left.run == right.run {
-                right.ordinal == left.ordinal + 1 && right.speech.start - left.speech.end <= 2.0
+                right.ordinal == left.ordinal + 1
             } else {
-                right.run == left.run + 1
-                    && left.last
-                    && right.ordinal == 0
-                    && left
-                        .cut_end
-                        .zip(right.cut_start)
-                        .is_some_and(|(end, start)| (start - end).abs() <= 0.45)
+                right.run == left.run + 1 && left.last && right.ordinal == 0
             }
         })
         .then_some(items)
-}
-
-fn safe_retakes(retakes: Vec<Retake>, utterances: &[TimelineUtterance<'_>]) -> Vec<Proposal> {
-    let mut unique = Vec::new();
-    let resolved: Vec<_> = retakes
-        .into_iter()
-        .filter(|retake| {
-            if unique.contains(retake) {
-                return false;
-            }
-            unique.push(*retake);
-            true
-        })
-        .filter_map(|retake| {
-            let keep = resolve(retake.keep, utterances)?;
-            let remove = resolve(retake.remove, utterances)?;
-            let keep_range = Range::new(keep.first()?.speech.start, keep.last()?.speech.end);
-            let remove_range = safe_removal_range(retake.remove, remove, utterances)?;
-            if remove_range.overlaps(keep_range) {
-                return None;
-            }
-            Some((keep, remove, keep_range, remove_range))
-        })
-        .collect();
-    resolved
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (keep, remove, keep_range, remove_range))| {
-            let conflict =
-                resolved
-                    .iter()
-                    .enumerate()
-                    .any(|(other, (_, _, other_keep, other_remove))| {
-                        other != index
-                            && (remove_range.overlaps(*other_remove)
-                                || remove_range.overlaps(*other_keep)
-                                || other_remove.overlaps(*keep_range))
-                    });
-            (!conflict).then(|| Proposal {
-                kind: "retake",
-                remove: *remove_range,
-                keep: Some(*keep_range),
-                removed_text: Some(join_text(remove)),
-                kept_text: Some(join_text(keep)),
-                reason: None,
-            })
-        })
-        .collect()
 }
 
 fn safe_removal_range(
@@ -999,6 +1021,7 @@ mod tests {
                 ordinal: 0,
                 last: true,
                 text: "An example".into(),
+                words: Vec::new(),
             }],
             ..Default::default()
         });
@@ -1010,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_distant_retakes_and_drops_conflicting_or_unsafe_cuts() {
+    fn safe_removal_uses_the_selected_range_and_requires_both_outer_boundaries() {
         let line = |run, time, safe: bool| TimelineUtterance {
             run,
             ordinal: 0,
@@ -1019,25 +1042,27 @@ mod tests {
             cut_start: safe.then_some(time + 0.1),
             cut_end: Some(time + 0.9),
             text: "Speech",
+            words: Vec::new(),
         };
         let lines = [
             line(0, 0.0, true),
             line(1, 5.0, false),
             line(2, 100.0, true),
         ];
-        let pair = |keep, remove| Retake {
-            keep: UtteranceRange {
-                first: keep,
-                last: keep,
-            },
-            remove: UtteranceRange {
-                first: remove,
-                last: remove,
-            },
-        };
-        let valid = safe_retakes(vec![pair(3, 1), pair(3, 1), pair(3, 2), pair(8, 1)], &lines);
-        assert_eq!(valid.len(), 1);
-        assert_eq!(valid[0].remove, Range::new(0.1, 0.9));
-        assert!(safe_retakes(vec![pair(3, 1), pair(1, 3)], &lines).is_empty());
+        let first = UtteranceRange { first: 1, last: 1 };
+        let unsafe_start = UtteranceRange { first: 2, last: 2 };
+        let distant = UtteranceRange { first: 3, last: 3 };
+        assert_eq!(
+            safe_removal_range(first, resolve(first, &lines).unwrap(), &lines),
+            Some(Range::new(0.1, 0.9))
+        );
+        assert!(
+            safe_removal_range(unsafe_start, resolve(unsafe_start, &lines).unwrap(), &lines)
+                .is_none()
+        );
+        assert_eq!(
+            safe_removal_range(distant, resolve(distant, &lines).unwrap(), &lines),
+            Some(Range::new(100.1, 100.9))
+        );
     }
 }

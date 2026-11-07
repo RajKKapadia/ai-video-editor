@@ -25,6 +25,8 @@ export type CutReviewProps = {
   previewing: boolean;
   onToggle: (index: number) => void;
   onSelectPauses: () => void;
+  onSelectRetakes: () => void;
+  onClearSelection: () => void;
   onAudition: (range: TimeRange) => void;
   onPreview: (range?: TimeRange) => void;
   onApply: () => void;
@@ -113,7 +115,7 @@ export function CleanupPanel({
 }
 
 export function CutReview({
-  report, checked, invalidSelection, onToggle, onSelectPauses,
+  report, checked, invalidSelection, onToggle, onSelectPauses, onSelectRetakes, onClearSelection,
   onAudition, onPreview, reviewingPauses = false, assistant = false,
 }: CutReviewProps & { report: CleanupReport; reviewingPauses?: boolean; assistant?: boolean }) {
   return (
@@ -121,6 +123,8 @@ export function CutReview({
       {report.retakeIssue && <p className="cleanup-warning" role="status">{report.retakeIssue}</p>}
       {report.transcriptCacheIssue && <p className="cleanup-warning" role="status">{report.transcriptCacheIssue}</p>}
       {report.runtimeNotice && <p className="cleanup-warning" role="status">{report.runtimeNotice}</p>}
+      {report.reviewNotes?.map((note, index) => <p className="cleanup-warning" role="status" key={index}>{note}</p>)}
+      {report.canClearTimeline && <p className="provider-note">All analyzed audio is quiet. Applying every removal will clear the timeline. Undo restores it.</p>}
       {report.speech && <p className="provider-note">Transcribed with {whisperModels[report.speech.model]} · {report.speech.device?.name ?? 'CPU'}</p>}
       {!!report.failedSources && (
         <p className="cleanup-warning" role="status">
@@ -132,10 +136,18 @@ export function CutReview({
           <h3>{reviewingPauses
             ? (report.proposals.length ? report.proposals.length + ' quiet gaps to review' : 'No pause removals suggested')
             : (report.proposals.length ? report.proposals.length + ' suggested cuts' : 'No cuts suggested')}</h3>
+        </div>
+        {!!report.proposals.length && <div className="cleanup-selection-actions">
           {report.proposals.some((proposal) => proposal.kind === 'pause') && (
             <button type="button" className="text-link" onClick={onSelectPauses}>Select all pauses</button>
           )}
-        </div>
+          {report.proposals.some((proposal) => proposal.kind === 'retake' || proposal.kind === 'cut') && (
+            <button type="button" className="text-link" title="Select repeated takes, false starts, and other transcript cuts" onClick={onSelectRetakes}>Select all retakes</button>
+          )}
+          <button type="button" className="text-link" disabled={!checked.size} onClick={onClearSelection}>Clear selection</button>
+          <p className="provider-note">{checked.size} of {report.proposals.length} selected. Only checked cuts are applied.</p>
+          <p className="provider-note">The draft and your selection save automatically with this project.</p>
+        </div>}
         <ul className="cleanup-results">
           {report.proposals.map((proposal, index) => (
             <li key={index}>

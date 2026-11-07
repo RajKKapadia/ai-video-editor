@@ -228,7 +228,7 @@ fn hardware(folder: &Path) -> Hardware {
         }
     };
     let signature = format!(
-        "calibration-v1|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{:?}",
+        "calibration-v2-word-alignment|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{:?}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         cpu,

@@ -11,7 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::{NamedTempFile, TempDir};
-use whisper_rs::{WhisperContext, WhisperContextParameters, WhisperState};
+use whisper_rs::{
+    DtwMode, DtwModelPreset, DtwParameters, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -233,7 +235,6 @@ pub(super) struct Transcriber<'a> {
     threads: usize,
     control: &'a Control,
     process: Option<PersistentWorker<'a>>,
-    one_shot: bool,
 }
 
 impl<'a> Transcriber<'a> {
@@ -244,7 +245,6 @@ impl<'a> Transcriber<'a> {
             threads,
             control,
             process: None,
-            one_shot: false,
         }
     }
 
@@ -271,7 +271,6 @@ impl<'a> Transcriber<'a> {
             Err(_) if self.device.is_some() && !self.control.cancel.is_cancelled() => {
                 self.process = None;
                 self.device = None;
-                self.one_shot = false;
                 if let Request::Transcribe { device, .. } = &mut job {
                     *device = None;
                 }
@@ -282,13 +281,8 @@ impl<'a> Transcriber<'a> {
     }
 
     fn run(&mut self, job: &Request, timeout: Duration) -> Result<Vec<Utterance>, String> {
-        if self.process.is_none() && !self.one_shot {
-            match PersistentWorker::start(job, self.control) {
-                Ok(process) => self.process = Some(process),
-                // Older acceleration sidecars still support the one-shot protocol.
-                Err(_) if self.device.is_some() => self.one_shot = true,
-                Err(error) => return Err(error),
-            }
+        if self.process.is_none() {
+            self.process = Some(PersistentWorker::start(job, self.control)?);
         }
         match &mut self.process {
             Some(process) => process.transcribe(job, timeout),
@@ -329,6 +323,15 @@ impl<'a> PersistentWorker<'a> {
             control,
         };
         worker.wait(Duration::from_secs(15))?;
+        if std::fs::read_to_string(worker.folder.path().join("protocol"))
+            .ok()
+            .as_deref()
+            != Some("2")
+        {
+            return Err(
+                "The speech worker is out of date and cannot provide word alignment.".into(),
+            );
+        }
         Ok(worker)
     }
 
@@ -432,6 +435,19 @@ fn load(model: &Path, device: Option<i32>) -> Result<WhisperContext, String> {
     params
         .use_gpu(device.is_some())
         .gpu_device(device.unwrap_or(0));
+    let preset = match model.file_name().and_then(|name| name.to_str()) {
+        Some("ggml-small.bin") => Some(DtwModelPreset::Small),
+        Some("ggml-medium.bin") => Some(DtwModelPreset::Medium),
+        Some("ggml-large-v3-turbo.bin") => Some(DtwModelPreset::LargeV3Turbo),
+        Some("ggml-large-v3.bin") => Some(DtwModelPreset::LargeV3),
+        _ => None,
+    };
+    if let Some(model_preset) = preset {
+        params.dtw_parameters(DtwParameters {
+            mode: DtwMode::ModelPreset { model_preset },
+            ..Default::default()
+        });
+    }
     WhisperContext::new_with_params(model.to_str().ok_or("Invalid model path.")?, params).map_err(
         |_| {
             "Could not load the Whisper model. Check available memory and the processing device."
@@ -578,6 +594,8 @@ fn serve(folder: &Path) -> Result<(), String> {
     let mut loaded = None;
     let mut stdin = std::io::stdin().lock();
     let mut signal = [0];
+    std::fs::write(folder.join("protocol"), "2")
+        .map_err(|_| "Could not identify the speech worker protocol.")?;
     signal_complete()?;
     while stdin
         .read(&mut signal)
@@ -647,6 +665,10 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.text.to_lowercase().contains("country"))
+        );
+        assert!(
+            lines.iter().map(|line| line.words.len()).sum::<usize>() >= 8,
+            "The current speech worker must return real word timing."
         );
         let pid = control.speech_child.lock().unwrap().as_ref().unwrap().id();
         let (repeated, fallback) = transcriber.transcribe(pcm.path(), detected, 8.0).unwrap();

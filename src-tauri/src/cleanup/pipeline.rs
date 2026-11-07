@@ -12,7 +12,8 @@ use tauri::{AppHandle, async_runtime::JoinHandle};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    Analysis, MediaInput, Session, TRANSCRIPT_LIMIT, TRANSCRIPT_TOO_LARGE,
+    Analysis, LOCAL_TRANSCRIPT_LIMIT as TRANSCRIPT_LIMIT,
+    LOCAL_TRANSCRIPT_TOO_LARGE as TRANSCRIPT_TOO_LARGE, MediaInput, Session,
     audio::{Engine, PreparedAudio},
     cache::{Cache, Transcript, linked_key},
     progress, speech,
@@ -275,6 +276,7 @@ fn collect(
                             devices.insert(device.to_owned());
                             transcript = Some(Transcript {
                                 model: model.to_owned(),
+                                alignment_version: super::cache::ALIGNMENT_VERSION,
                                 device: device.to_owned(),
                                 utterances: result.utterances.clone(),
                             });

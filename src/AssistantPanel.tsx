@@ -90,7 +90,7 @@ export function AssistantPanel({
       </div>
       <div className="cleanup-body">
         <div className="assistant-controls">
-          <p className="provider-note">Draft cuts for false starts, repeated takes, and quiet gaps, then review them together.</p>
+          <p className="provider-note">Draft cleanup for the entire sequence: false starts, repeated words and takes, and quiet gaps. Preview and apply the cuts you choose.</p>
           <p className="provider-note">
             {ready && active && profile
               ? <>Whisper runs locally. Your brief, transcript, and timing go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}. Transcript questions and Advanced analysis also send recent conversation.</>
@@ -114,7 +114,7 @@ export function AssistantPanel({
               disabled={!!progress}
             />
             <div className="assistant-actions">
-              <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', 'Suggest cuts for clear false starts, repeated takes, and dispensable quiet gaps. Preserve unique details and pauses that may be part of a demonstration.')}>
+              <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', 'Remove clear false starts, repeated words or passages, recording count-ins, and dispensable quiet gaps. Keep the clearest complete take. Preserve unique details, intentional pauses, and time used for demonstrations.')}>
                 Draft cleanup
               </button>
               <button type="submit" className="button secondary" disabled={!canRun || !prompt.trim()}>Ask about transcript</button>
