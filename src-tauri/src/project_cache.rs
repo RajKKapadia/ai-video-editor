@@ -6,7 +6,7 @@ use std::{
     sync::Mutex,
 };
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -113,7 +113,11 @@ fn save(path: &Path, snapshot: &ProjectSnapshot, replacing: bool) -> Result<(), 
     write_json(path, snapshot, replacing)
 }
 
-fn write_json(path: &Path, value: &impl Serialize, replacing: bool) -> Result<(), String> {
+pub(crate) fn write_json(
+    path: &Path,
+    value: &impl Serialize,
+    replacing: bool,
+) -> Result<(), String> {
     let dir = path.parent().ok_or("Invalid project cache path.")?;
     let mut file = NamedTempFile::new_in(dir).map_err(|err| err.to_string())?;
     {
@@ -138,21 +142,6 @@ pub(crate) fn store_transcript(
     let cache = app.state::<ProjectCache>();
     let _guard = cache.io.lock().unwrap();
     store_project_transcript(&cache_path(app)?, project_id, transcript)
-}
-
-pub(crate) fn read_transcript<T: DeserializeOwned>(
-    app: &AppHandle,
-    project_id: &str,
-) -> Result<Option<T>, String> {
-    with_project_cache(app, project_id, |folder| {
-        match File::open(transcript_path(folder, project_id)) {
-            Ok(file) => serde_json::from_reader(BufReader::new(file))
-                .map(Some)
-                .map_err(|err| err.to_string()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
-    })
 }
 
 pub(crate) fn with_project_cache<T>(

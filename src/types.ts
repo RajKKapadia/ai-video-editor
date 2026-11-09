@@ -1,3 +1,5 @@
+import type { SavedCleanupDraft } from './cleanupDraft';
+
 export type Clip = {
   id: string;
   name: string;
@@ -25,6 +27,7 @@ export type Project = {
   clips: Clip[];
   timeline: Segment[];
   messages: Message[];
+  cleanupDraft?: SavedCleanupDraft;
 };
 
 export const uid = () => crypto.randomUUID();

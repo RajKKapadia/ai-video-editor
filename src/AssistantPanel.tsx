@@ -6,6 +6,7 @@ import {
   errorMessage, providers,
   type AssistantRequest, type CleanupProgress, type ProviderStatus,
 } from './cleanupNative';
+import type { SpeechStatus } from './speechNative';
 import type { AssistantMessage, CleanupReport } from './cleanupTimeline';
 
 type Props = {
@@ -31,6 +32,7 @@ export function AssistantPanel({
   messages, review, onRun, onApplyPauses, onCancel, onClose, onSettings,
 }: Props) {
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
+  const [speech, setSpeech] = useState<SpeechStatus | null>(null);
   const [providerError, setProviderError] = useState('');
   const [saved, setSaved] = useState<AssistantMessage[]>([]);
   const [historyError, setHistoryError] = useState('');
@@ -39,6 +41,7 @@ export function AssistantPanel({
 
   useEffect(() => {
     let current = true;
+    void invoke<SpeechStatus>('speech_status').then((saved) => { if (current) setSpeech(saved); }).catch(() => {});
     void invoke<ProviderStatus>('ai_provider_status').then((status) => {
       if (current) {
         setProviderStatus(status);
@@ -90,10 +93,10 @@ export function AssistantPanel({
       </div>
       <div className="cleanup-body">
         <div className="assistant-controls">
-          <p className="provider-note">Draft cuts for false starts, repeated takes, and quiet gaps, then review them together.</p>
+          <p className="provider-note">Draft cleanup for the entire sequence: false starts, repeated words and takes, and quiet gaps. Preview and apply the cuts you choose.</p>
           <p className="provider-note">
             {ready && active && profile
-              ? <>Whisper runs locally. Your brief, transcript, and timing go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}. Transcript questions and Advanced analysis also send recent conversation.</>
+              ? <>{speech?.config.engine === 'openAi' ? 'Audio is sent to OpenAI for word-timed transcription.' : speech ? 'Whisper runs locally.' : 'Transcription follows your saved settings.'} Your brief, transcript, and timing go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}. Transcript questions and Advanced analysis also send recent conversation.</>
               : providerError || providerStatus?.warning || 'Set up an AI provider to use the timeline assistant.'}
             {' '}<button className="text-link" type="button" onClick={() => onSettings('providers')}>AI providers</button>
             {' · '}<button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription</button>
@@ -114,7 +117,7 @@ export function AssistantPanel({
               disabled={!!progress}
             />
             <div className="assistant-actions">
-              <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', 'Suggest cuts for clear false starts, repeated takes, and dispensable quiet gaps. Preserve unique details and pauses that may be part of a demonstration.')}>
+              <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', 'Remove clear false starts, repeated words or passages, recording count-ins, and dispensable quiet gaps. Keep the clearest complete take. Preserve unique details, intentional pauses, and time used for demonstrations.')}>
                 Draft cleanup
               </button>
               <button type="submit" className="button secondary" disabled={!canRun || !prompt.trim()}>Ask about transcript</button>
@@ -128,12 +131,12 @@ export function AssistantPanel({
                   </button>
                 )}
                 {needsCuts && (
-                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Transcribe the reviewed timeline again and suggest cuts.')}>
-                    Transcribe and find cuts
+                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Suggest cuts for the reviewed timeline.')}>
+                    Find cuts
                   </button>
                 )}
                 {reviewingPauses && (
-                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Keep the pauses as they are. Transcribe the reviewed timeline and suggest cuts.')}>
+                  <button type="button" className="button secondary" disabled={!canRun} onClick={() => submit('cuts', 'Keep the pauses as they are and suggest cuts for the reviewed timeline.')}>
                     Find cuts without removing pauses
                   </button>
                 )}
@@ -163,7 +166,7 @@ export function AssistantPanel({
               reviewingPauses={reviewingPauses}
               canApply={!reviewingPauses || canRun}
               onApply={reviewingPauses
-                ? () => submit('cuts', 'I applied the selected pause removals. Transcribe the edited timeline and suggest cuts.', true)
+                ? () => submit('cuts', 'I applied the selected pause removals. Suggest cuts for the edited timeline.', true)
                 : review.onApply}
             />
           </>

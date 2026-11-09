@@ -25,6 +25,8 @@ export type CutReviewProps = {
   previewing: boolean;
   onToggle: (index: number) => void;
   onSelectPauses: () => void;
+  onSelectRetakes: () => void;
+  onClearSelection: () => void;
   onAudition: (range: TimeRange) => void;
   onPreview: (range?: TimeRange) => void;
   onApply: () => void;
@@ -77,7 +79,7 @@ export function CleanupPanel({
               <legend>Analyze the entire sequence</legend>
               <label><input type="checkbox" checked={pauses} onChange={(event) => setPauses(event.target.checked)} /> Shorten pauses</label>
               <label><input type="checkbox" checked={retakes} onChange={(event) => setRetakes(event.target.checked)} /> Remove repeated takes</label>
-              {retakes && speech && <p className="provider-note">{whisperModels[speech.selection.model]} · {speech.selection.device?.name ?? 'CPU'} · <button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription settings</button></p>}
+              {retakes && speech && <p className="provider-note">{speech.config.engine === 'openAi' ? 'OpenAI API · whisper-1' : `${whisperModels[speech.selection.model]} · ${speech.selection.device?.name ?? 'CPU'}`} · <button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription settings</button></p>}
               {retakes ? (
                 <p className="provider-note">
                   {active && profile?.ready
@@ -89,7 +91,7 @@ export function CleanupPanel({
                 <p className="provider-note">Speech analysis runs on this device. First use downloads the required speech models.</p>
               )}
               {retakes && active && profile?.ready && (
-                <p className="provider-note">First use downloads the local speech models. Comparing takes may use your provider quota.</p>
+                <p className="provider-note">{speech?.config.engine === 'openAi' ? 'Audio is sent to OpenAI using your saved key. Transcription and take review use your provider quota.' : 'First use downloads the local speech models. Comparing takes may use your provider quota.'}</p>
               )}
               {!hasAudio && <p className="provider-note">Add footage with audio to your timeline to start.</p>}
               <button className="button secondary" disabled={!hasAudio || (!pauses && !retakes) || (retakes && !profile?.ready)} onClick={() => {
@@ -113,7 +115,7 @@ export function CleanupPanel({
 }
 
 export function CutReview({
-  report, checked, invalidSelection, onToggle, onSelectPauses,
+  report, checked, invalidSelection, onToggle, onSelectPauses, onSelectRetakes, onClearSelection,
   onAudition, onPreview, reviewingPauses = false, assistant = false,
 }: CutReviewProps & { report: CleanupReport; reviewingPauses?: boolean; assistant?: boolean }) {
   return (
@@ -121,6 +123,19 @@ export function CutReview({
       {report.retakeIssue && <p className="cleanup-warning" role="status">{report.retakeIssue}</p>}
       {report.transcriptCacheIssue && <p className="cleanup-warning" role="status">{report.transcriptCacheIssue}</p>}
       {report.runtimeNotice && <p className="cleanup-warning" role="status">{report.runtimeNotice}</p>}
+      {report.planning && <details className="cleanup-planning-details">
+        <summary>Planning details · {report.planning.reviewedUtterances} of {report.planning.totalUtterances} transcript entries reviewed</summary>
+        <p className="provider-note">{report.planning.strategy === 'fullTimeline' ? 'Reviewed the complete transcript together.' : 'Reviewed overlapping sections and compared likely distant repeats.'} These diagnostics refer to the timeline when analysis started.</p>
+        {report.planning.fallbackReason && <p className="provider-note">{report.planning.fallbackReason}</p>}
+        <ol>{report.planning.reviews.map((entry, index) => <li key={index}>
+          {entry.scope === 'fullTimeline' ? 'Complete transcript' : entry.scope === 'comparison' ? 'Distant take comparison' : 'Transcript section'}: {entry.completed ? `${entry.edits} suggestions` : 'Incomplete'} · {entry.passes.length} planning passes
+          {entry.error && <p className="cleanup-warning">{entry.error}</p>}
+          <ul>{entry.passes.map((pass, passIndex) => <li key={passIndex}>{pass.validation}</li>)}</ul>
+        </li>)}</ol>
+      </details>}
+      {report.reviewNotes?.map((note, index) => <p className="cleanup-warning" role="status" key={index}>{note}</p>)}
+      {report.canClearTimeline && <p className="provider-note">All analyzed audio is quiet. Applying every removal will clear the timeline. Undo restores it.</p>}
+      {report.processingDevice === 'OpenAI API' && <p className="provider-note">Transcribed with OpenAI API · whisper-1</p>}
       {report.speech && <p className="provider-note">Transcribed with {whisperModels[report.speech.model]} · {report.speech.device?.name ?? 'CPU'}</p>}
       {!!report.failedSources && (
         <p className="cleanup-warning" role="status">
@@ -132,10 +147,18 @@ export function CutReview({
           <h3>{reviewingPauses
             ? (report.proposals.length ? report.proposals.length + ' quiet gaps to review' : 'No pause removals suggested')
             : (report.proposals.length ? report.proposals.length + ' suggested cuts' : 'No cuts suggested')}</h3>
+        </div>
+        {!!report.proposals.length && <div className="cleanup-selection-actions">
           {report.proposals.some((proposal) => proposal.kind === 'pause') && (
             <button type="button" className="text-link" onClick={onSelectPauses}>Select all pauses</button>
           )}
-        </div>
+          {report.proposals.some((proposal) => proposal.kind === 'retake' || proposal.kind === 'cut') && (
+            <button type="button" className="text-link" title="Select repeated takes, false starts, and other transcript cuts" onClick={onSelectRetakes}>Select all retakes</button>
+          )}
+          <button type="button" className="text-link" disabled={!checked.size} onClick={onClearSelection}>Clear selection</button>
+          <p className="provider-note">{checked.size} of {report.proposals.length} selected. Only checked cuts are applied.</p>
+          <p className="provider-note">The draft and your selection save automatically with this project.</p>
+        </div>}
         <ul className="cleanup-results">
           {report.proposals.map((proposal, index) => (
             <li key={index}>

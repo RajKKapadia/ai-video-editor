@@ -11,10 +11,11 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { Brand } from './App';
 import { AssistantPanel } from './AssistantPanel';
 import { CleanupPanel } from './CleanupPanel';
+import { remainingCleanupReview, restoreCleanupDraft, type CleanupReview, type SavedCleanupDraft } from './cleanupDraft';
 import { ExportPanel } from './ExportPanel';
 import { Icon, type IconName } from './Icon';
 import { analyzeTimeline, errorMessage, hasAnalyzableAudio, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
-import { canPreviewCleanupDraft, makeCleanupEdit, minSegmentDuration, type AssistantMessage, type CleanupReport, type TimeRange } from './cleanupTimeline';
+import { canPreviewCleanupDraft, makeCleanupEdit, minSegmentDuration, prepareCleanupReview, type AssistantMessage, type TimeRange } from './cleanupTimeline';
 import { inspectMedia, storeMedia } from './cache';
 import { importConcurrency, mapConcurrent } from './resources';
 import { TimelineRuler, useTimelineZoom } from './timelineView';
@@ -99,6 +100,7 @@ export function Editor({
   cacheError,
 }: EditorProps) {
   const desktop = isTauri();
+  const [restoredDraft] = useState(() => restoreCleanupDraft(project.cleanupDraft, project.timeline));
   const [selectedId, setSelectedId] = useState<string | null>(
     project.clips[0]?.id || null,
   );
@@ -115,22 +117,23 @@ export function Editor({
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState('name');
   const [layout, setLayout] = useState('grid');
-  const [aiOpen, setAiOpen] = useState(() => window.innerWidth > 1000);
+  const [aiOpen, setAiOpen] = useState(() => !!restoredDraft?.review?.assistant || window.innerWidth > 1000);
   const [prompt, setPrompt] = useState('');
   const [notice, setNotice] = useState('');
   const [importing, setImporting] = useState(false);
   const [dropping, setDropping] = useState(false);
   const [selectedSegment, setSelectedSegment] = useState<string | null>(null);
-  const [history, setHistory] = useState<{ before: Segment[]; after: Segment[] }[]>([]);
-  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [history, setHistory] = useState<{ before: Segment[]; after: Segment[]; cleanup: SavedCleanupDraft | null }[]>([]);
+  const [cleanupOpen, setCleanupOpen] = useState(() => !!restoredDraft?.review && !restoredDraft.review.assistant);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportBusy, setExportBusy] = useState(false);
   const [cleanupProgress, setCleanupProgress] = useState<CleanupProgress | null>(null);
-  const [cleanupError, setCleanupError] = useState('');
-  const [cleanupReview, setCleanupReview] = useState<{ snapshot: Segment[]; report: CleanupReport; assistant?: AssistantRequest['stage'] } | null>(null);
+  const [cleanupError, setCleanupError] = useState(() => project.cleanupDraft && !restoredDraft
+    ? 'The saved cleanup draft no longer matches this timeline. Run the analysis again.' : '');
+  const [cleanupReview, setCleanupReview] = useState<CleanupReview | null>(restoredDraft?.review ?? null);
   const [assistantMessages, setAssistantMessages] = useState<AssistantMessage[]>([]);
-  const [pendingCuts, setPendingCuts] = useState<Segment[] | null>(null);
-  const [checkedCuts, setCheckedCuts] = useState<ReadonlySet<number>>(() => new Set());
+  const [pendingCuts, setPendingCuts] = useState<Segment[] | null>(restoredDraft?.pendingCuts ?? null);
+  const [checkedCuts, setCheckedCuts] = useState<ReadonlySet<number>>(() => new Set(restoredDraft?.checked));
   const [preview, setPreview] = useState(false);
   const [audition, setAudition] = useState<TimeRange | null>(null);
   const cleanupJob = useRef<{ snapshot: Segment[]; controller: AbortController; assistant: boolean } | null>(null);
@@ -161,7 +164,7 @@ export function Editor({
     if (!cleanupReport) return null;
     return makeCleanupEdit(project.timeline, cleanupReport.proposals.flatMap((cut, index) =>
       checkedCuts.has(index) ? [cut.remove] : [],
-    ));
+    ), cleanupReport.canClearTimeline);
   }, [cleanupReport, project.timeline, checkedCuts]);
   const previewing = preview && !!cleanupEdit;
   const timeline = previewing ? cleanupEdit.timeline : project.timeline;
@@ -303,11 +306,24 @@ export function Editor({
     if (!changedDuringAnalysis && !changedAfterAnalysis) return;
     cleanupJob.current?.controller.abort();
     setCleanupReview(null);
+    setPendingCuts(null);
     setCheckedCuts(new Set());
     setPreview(false);
     setAudition(null);
     setCleanupError('The timeline changed. Run the analysis again to review suggestions.');
   }, [project.timeline, cleanupReview]);
+
+  useEffect(() => {
+    const review = cleanupReview?.snapshot === project.timeline ? cleanupReview : null;
+    const pending = pendingCuts === project.timeline ? pendingCuts : null;
+    const draft: SavedCleanupDraft | undefined = review || pending
+      ? { version: 1, review, checked: [...checkedCuts], pendingCuts: pending }
+      : undefined;
+    onUpdate((current) => {
+      if (current.timeline !== project.timeline || (!draft && !current.cleanupDraft)) return current;
+      return { ...current, cleanupDraft: draft };
+    }, true);
+  }, [cleanupReview, checkedCuts, pendingCuts, project.timeline, onUpdate]);
 
   useEffect(() => {
     const pauseWhenHidden = () => {
@@ -464,10 +480,13 @@ export function Editor({
     if (targetMode === 'sequence') setSequenceMarks({});
     else if (selectedId) setMarks((existing) => ({ ...existing, [selectedId]: {} }));
   }
-  function changeTimeline(next: Segment[], expected?: Segment[]) {
-    setHistory((previous) => [...previous.slice(-29), { before: project.timeline, after: next }]);
+  function changeTimeline(next: Segment[], expected?: Segment[], draft?: SavedCleanupDraft) {
+    const cleanup: SavedCleanupDraft | null = cleanupReview?.snapshot === project.timeline || pendingCuts === project.timeline
+      ? { version: 1, review: cleanupReview?.snapshot === project.timeline ? cleanupReview : null, checked: [...checkedCuts], pendingCuts: pendingCuts === project.timeline ? pendingCuts : null }
+      : null;
+    setHistory((previous) => [...previous.slice(-29), { before: project.timeline, after: next, cleanup }]);
     setSequenceMarks({});
-    onUpdate((current) => expected && current.timeline !== expected ? current : { ...current, timeline: next });
+    onUpdate((current) => expected && current.timeline !== expected ? current : { ...current, timeline: next, cleanupDraft: draft });
   }
   function insert(clip = source, position = sequenceTime) {
     if (!clip || previewing) return;
@@ -506,7 +525,12 @@ export function Editor({
   function undo() {
     if (previewing || !canUndo || !lastEdit) return;
     const { before, after } = lastEdit;
-    onUpdate((current) => current.timeline === after ? { ...current, timeline: before } : current);
+    onUpdate((current) => current.timeline === after ? { ...current, timeline: before, cleanupDraft: lastEdit.cleanup ?? undefined } : current);
+    setCleanupReview(lastEdit.cleanup?.review ?? null);
+    setCheckedCuts(new Set(lastEdit.cleanup?.checked));
+    setPendingCuts(lastEdit.cleanup?.pendingCuts ?? null);
+    setCleanupError('');
+    setAudition(null);
     setHistory((items) => items.slice(0, -1));
     setSequenceTime((time) => Math.min(time, sequenceLength(before)));
     setPlaying(false);
@@ -568,24 +592,24 @@ export function Editor({
     const stage = options.assistant?.stage;
     const job = { snapshot, controller: new AbortController(), assistant: !!stage };
     cleanupJob.current = job;
-    if (stage !== 'chat') {
-      if (snapshot === project.timeline) resetCleanupPreview();
-      setCleanupReview(null);
-      setCheckedCuts(new Set());
-    }
+    if (stage !== 'chat' && snapshot === project.timeline) resetCleanupPreview();
     if (stage === 'cuts') setPendingCuts(snapshot);
     if (stage === 'pauses' || stage === 'draft') setPendingCuts(null);
     setCleanupError('');
     setCleanupProgress({ stage: stage ? 'Preparing the timeline assistant' : 'Preparing timeline cleanup', fraction: null });
     try {
-      const report = await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
+      const result = await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
+      const report = prepareCleanupReview(job.snapshot, result);
       if (cleanupJob.current !== job || job.controller.signal.aborted) return;
       if (stage === 'draft' && !canPreviewCleanupDraft(snapshot, report)) {
         throw new Error('The cleanup draft could not be applied safely to this timeline. Try a more specific brief.');
       }
       const turn = report.assistantTurn;
       if (turn) setAssistantMessages((messages) => [...messages, ...turn]);
-      if (stage !== 'chat') setCleanupReview({ snapshot: job.snapshot, report, assistant: stage });
+      if (stage !== 'chat') {
+        setCleanupReview({ snapshot: job.snapshot, report, assistant: stage });
+        setCheckedCuts(new Set());
+      }
       if (stage === 'cuts') setPendingCuts(null);
     } catch (error) {
       if (!job.controller.signal.aborted) setCleanupError(errorMessage(error, 'Could not analyze the timeline.'));
@@ -637,8 +661,10 @@ export function Editor({
   function applyCleanup(nextAssistantStage?: AssistantRequest) {
     if (!cleanupEdit || !currentReview || cleanupJob.current) return;
     const position = previewing ? sequenceTime : cleanupEdit.mapTime(sequenceTime);
-    changeTimeline(cleanupEdit.timeline, currentReview.assistant === 'draft' ? currentReview.snapshot : undefined);
-    setCleanupReview(null);
+    const remaining = nextAssistantStage ? null : remainingCleanupReview(currentReview, checkedCuts, cleanupEdit);
+    changeTimeline(cleanupEdit.timeline, currentReview.snapshot, remaining
+      ? { version: 1, review: remaining, checked: [], pendingCuts: null } : undefined);
+    setCleanupReview(remaining);
     setCheckedCuts(new Set());
     setPreview(false);
     setAudition(null);
@@ -646,9 +672,19 @@ export function Editor({
     setMode('sequence');
     setSequenceTime(position);
     setPlaying(false);
-    if (!currentReview.assistant) setCleanupOpen(false);
+    if (!currentReview.assistant && !remaining) setCleanupOpen(false);
     if (nextAssistantStage) runAssistant(nextAssistantStage, cleanupEdit.timeline);
-    setNotice('Timeline cleanup applied. Undo to restore the original sequence.');
+    setNotice(remaining
+      ? `Selected cuts applied. ${remaining.report.proposals.length} suggestions remain. Undo restores the previous draft and timeline.`
+      : 'Timeline cleanup applied. Undo to restore the original sequence.');
+  }
+
+  function selectCutKind(pauses: boolean) {
+    resetCleanupPreview();
+    setCheckedCuts((checked) => new Set([
+      ...checked,
+      ...(cleanupReport?.proposals.flatMap((cut, index) => (cut.kind === 'pause') === pauses ? [index] : []) ?? []),
+    ]));
   }
 
   const cutReview = {
@@ -666,11 +702,14 @@ export function Editor({
       });
     },
     onSelectPauses() {
+      selectCutKind(true);
+    },
+    onSelectRetakes() {
+      selectCutKind(false);
+    },
+    onClearSelection() {
       resetCleanupPreview();
-      setCheckedCuts((checked) => new Set([
-        ...checked,
-        ...(cleanupReport?.proposals.flatMap((cut, index) => cut.kind === 'pause' ? [index] : []) ?? []),
-      ]));
+      setCheckedCuts(new Set());
     },
     onAudition: (range: TimeRange) => playCleanupRange(range, false),
     onPreview: previewCleanup,

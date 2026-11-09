@@ -1,4 +1,7 @@
+mod chunks;
 pub(super) mod draft;
+pub(crate) mod planning;
+mod selections;
 
 use std::{collections::HashSet, path::Path};
 
@@ -34,7 +37,7 @@ impl Stage {
         match self {
             Self::Draft => "Planning cleanup from the timeline transcript",
             Self::Pauses => "Reviewing transcript context around quiet gaps",
-            Self::Cuts => "Planning cuts from the refreshed transcript",
+            Self::Cuts => "Planning cuts from the current transcript",
             Self::Chat => "Reading the transcript",
         }
     }
@@ -152,18 +155,22 @@ pub(crate) async fn assistant_history(
     .map_err(|_| "Could not load the assistant conversation.")?
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PauseChoice {
     id: usize,
     reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CutChoice {
     remove: UtteranceRange,
     keep: Option<UtteranceRange>,
+    #[serde(default, rename = "removeWords")]
+    remove_words: Option<selections::WordRange>,
+    #[serde(default, rename = "keepWords")]
+    keep_words: Option<selections::WordRange>,
     reason: String,
 }
 
@@ -175,7 +182,7 @@ struct Reply {
     cuts: Vec<CutChoice>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Gap {
     id: usize,
@@ -191,22 +198,33 @@ pub(super) fn transcript_gaps(
     let mut gaps = Vec::new();
     for (run, range) in candidates {
         let after = utterances.partition_point(|line| line.speech.start < range.end);
-        let Some(before) = after.checked_sub(1) else {
-            continue;
+        let left = after.checked_sub(1).and_then(|index| utterances.get(index));
+        let right = utterances.get(after);
+        // Edge gaps also need context: zero means there is no utterance on that
+        // side. Never present a gap covering untranscribed or detected speech.
+        let fits_left = left.is_none_or(|line| line.speech.end <= range.start + 0.000_001);
+        let consecutive = match (left, right) {
+            (Some(left), Some(right)) if left.run == run && right.run == run => {
+                left.ordinal + 1 == right.ordinal
+            }
+            (left, Some(right)) if right.run == run => {
+                right.ordinal == 0 && left.is_none_or(|line| line.run < run && line.last)
+            }
+            (Some(left), right) if left.run == run => {
+                left.last && right.is_none_or(|line| line.run > run && line.ordinal == 0)
+            }
+            (left, right) => {
+                // A separate source can be entirely quiet. The measured candidate
+                // is still reviewable using speech from its neighboring sources.
+                left.is_none_or(|line| line.run < run && line.last)
+                    && right.is_none_or(|line| line.run > run && line.ordinal == 0)
+            }
         };
-        let Some(right) = utterances.get(after) else {
-            continue;
-        };
-        let left = &utterances[before];
-        if left.run == run
-            && right.run == run
-            && left.ordinal + 1 == right.ordinal
-            && left.speech.end <= range.start
-        {
+        if fits_left && consecutive {
             gaps.push(Gap {
                 id: gaps.len() + 1,
-                before: before + 1,
-                after: after + 1,
+                before: left.map_or(0, |_| after),
+                after: right.map_or(0, |_| after + 1),
                 range,
             });
         }
@@ -231,12 +249,12 @@ fn stage_instruction(stage: Stage) -> Result<&'static str, String> {
             A pause's length alone is insufficient evidence. For each selection return its gap id and a short reason. Return cuts as []."
         }
         Stage::Cuts => {
-            "Use the refreshed transcript to propose high-confidence removals of complete utterances, such as redundant takes, \
+            "Use the current transcript to propose high-confidence removals of complete utterances, such as redundant takes, \
             abandoned starts or explicit recording chatter. Use the user's editing direction and retain the strongest complete version \
             of any repeated material and all unique details. Each cut has a remove range with inclusive first and last utterance IDs \
             and a short reason. For repeated takes include the range of the kept version in keep. For other cuts set keep to null. \
             The cutBoundaries rows are [utterance ID, source run ID, can start a cut, can end a cut]. Choose only removals \
-            with valid boundaries inside a single source run. \
+            with valid outer boundaries. Ranges may cross existing timeline cuts when all selected utterances are consecutive. \
             Return pauses as []."
         }
         Stage::Chat => {
@@ -260,8 +278,9 @@ fn task_schema() -> serde_json::Value {
                 "type": "object", "properties": {
                     "remove": utterance_range_schema(), "keep": {"anyOf": [utterance_range_schema(), {"type": "null"}]},
                     "reason": reason
+                    ,"removeWords": selections::word_range_schema(), "keepWords": selections::word_range_schema()
                 },
-                "required": ["remove", "keep", "reason"], "additionalProperties": false
+                "required": ["remove", "keep", "removeWords", "keepWords", "reason"], "additionalProperties": false
             }}
         },
         "required": ["summary", "pauses", "cuts"], "additionalProperties": false
@@ -275,7 +294,7 @@ pub(super) async fn review(
     transcript: &[CachedUtterance],
     utterances: &[TimelineUtterance<'_>],
     gaps: &[Gap],
-) -> Result<(Vec<Proposal>, Vec<Message>), String> {
+) -> Result<(Vec<Proposal>, Vec<Message>, Vec<String>), String> {
     let (stage, message) = session
         .assistant
         .as_ref()
@@ -323,34 +342,77 @@ pub(super) async fn review(
         "quietGaps": gaps,
         "cutBoundaries": cut_boundaries,
     }).to_string();
-    if input.len() > INPUT_LIMIT {
+    if stage == Stage::Chat && input.len() > INPUT_LIMIT {
         return Err(INPUT_TOO_LARGE.into());
     }
-    let schema = task_schema();
-    let instructions = format!("{CONTEXT} {stage_instruction} Response schema: {schema}");
-    let reply = connection
-        .complete(
-            &input,
-            Task {
-                name: "timeline_assistant",
-                instructions: &instructions,
-                schema,
-            },
-            &session.control.cancel,
-        )
-        .await?;
-    let reply: Reply =
-        serde_json::from_str(&reply).map_err(|_| "The assistant returned an invalid review.")?;
-    if reply.summary.trim().is_empty() || reply.pauses.len() > 100 || reply.cuts.len() > 100 {
-        return Err("The assistant returned an invalid review.".into());
-    }
-    let mut proposals = match stage {
-        Stage::Pauses => pause_proposals(gaps, reply.pauses),
-        Stage::Cuts => cut_proposals(utterances, reply.cuts),
-        Stage::Chat | Stage::Draft => Vec::new(),
+    let (mut proposals, mut answer, notes) = if matches!(stage, Stage::Cuts | Stage::Pauses) {
+        let preferences = json!(
+            previous
+                .iter()
+                .filter(|entry| entry.role == "user")
+                .map(|entry| bounded(&entry.text, 1000))
+                .collect::<Vec<_>>()
+        );
+        let brief = format!(
+            "{stage_instruction} Current editing direction: {message}\nRecent user messages, for still-relevant preferences only: {preferences}. Earlier timestamps and utterance IDs are obsolete; use only the current evidence."
+        );
+        let draft = if stage == Stage::Pauses {
+            draft::run_pauses(
+                connection,
+                &brief,
+                utterances,
+                gaps,
+                &session.control.cancel,
+            )
+            .await?
+        } else {
+            draft::run(connection, &brief, utterances, &[], &session.control.cancel).await?
+        };
+        (draft.proposals, draft.summary, draft.notes)
+    } else {
+        let schema = task_schema();
+        let instructions = format!("{CONTEXT} {stage_instruction} Response schema: {schema}");
+        let reply = connection
+            .complete(
+                &input,
+                Task {
+                    name: "timeline_assistant",
+                    instructions: &instructions,
+                    schema,
+                    output_tokens: 4096,
+                },
+                &session.control.cancel,
+            )
+            .await?;
+        let reply: Reply = serde_json::from_str(&reply)
+            .map_err(|_| "The assistant returned an invalid review.")?;
+        if reply.summary.trim().is_empty() || reply.pauses.len() > 100 || reply.cuts.len() > 100 {
+            return Err("The assistant returned an invalid review.".into());
+        }
+        let proposed_count = match stage {
+            Stage::Pauses => reply.pauses.len(),
+            Stage::Cuts => reply.cuts.len(),
+            _ => 0,
+        };
+        let proposals = match stage {
+            Stage::Pauses => pause_proposals(gaps, reply.pauses),
+            Stage::Cuts => cut_proposals(utterances, reply.cuts),
+            Stage::Chat | Stage::Draft => Vec::new(),
+        };
+        let notes = if proposals.len() < proposed_count {
+            vec![format!(
+                "{} proposed edits did not have valid timing or conflicted with retained speech and were left unchanged.",
+                proposed_count - proposals.len()
+            )]
+        } else {
+            Vec::new()
+        };
+        (proposals, bounded(&reply.summary, 3500), notes)
     };
     proposals.sort_by(|left, right| left.remove.start.total_cmp(&right.remove.start));
-    let mut answer = bounded(&reply.summary, 3500);
+    for note in &notes {
+        answer.push_str(&format!("\n\n{note}"));
+    }
     match stage {
         Stage::Pauses => {
             answer.push_str(&format!("\n\nQuiet gaps to review: {}.", proposals.len()))
@@ -372,7 +434,7 @@ pub(super) async fn review(
     })
     .await
     .map_err(|_| "Could not save the assistant conversation.")??;
-    Ok((proposals, messages))
+    Ok((proposals, messages, notes))
 }
 
 fn bounded(text: &str, characters: usize) -> String {
@@ -404,64 +466,83 @@ fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) 
         .into_iter()
         .filter_map(|choice| {
             let range = choice.remove;
-            let lines = resolve(range, utterances)?;
-            let first = lines.first()?;
-            let last = lines.last()?;
-            let remove = safe_removal_range(range, lines, utterances)?;
+            let selection = selections::select(range, choice.remove_words, utterances)?;
+            let remove = selection.removal?;
             let (keep, kept_text) = if let Some(range) = choice.keep {
-                let lines = resolve(range, utterances)?;
-                let keep = Range::new(lines.first()?.speech.start, lines.last()?.speech.end);
-                if remove.overlaps(keep) {
+                let kept = selections::select(range, choice.keep_words, utterances)?;
+                if remove.overlaps(kept.speech) {
                     return None;
                 }
-                (Some(keep), Some(join_text(lines)))
+                (Some(kept.speech), Some(kept.text))
             } else {
+                if choice.keep_words.is_some() {
+                    return None;
+                }
                 (None, None)
             };
             let reason = bounded(&choice.reason, 350);
-            if reason.is_empty()
-                || first.run != last.run
-                || lines
-                    .windows(2)
-                    .any(|pair| pair[1].speech.start - pair[0].speech.end >= 0.8)
-                || !seen.insert((range.first, range.last))
-            {
+            if reason.is_empty() || !seen.insert((remove.start.to_bits(), remove.end.to_bits())) {
                 return None;
             }
-            Some((
-                lines.len(),
-                Proposal {
-                    kind: if keep.is_some() { "retake" } else { "cut" },
-                    remove,
-                    keep,
-                    removed_text: Some(join_text(lines)),
-                    kept_text,
-                    reason: Some(reason),
-                },
-            ))
+            Some(Proposal {
+                kind: if keep.is_some() { "retake" } else { "cut" },
+                remove,
+                keep,
+                removed_text: Some(selection.text),
+                kept_text,
+                reason: Some(reason),
+            })
         })
         .collect();
     let approved: Vec<_> = candidates
         .iter()
         .enumerate()
-        .filter(|(index, (_, cut))| {
+        .filter(|(index, cut)| {
             !candidates
                 .iter()
                 .enumerate()
-                .any(|(other, (_, candidate))| *index != other && conflicts(cut, candidate))
+                .any(|(other, candidate)| *index != other && conflicts(cut, candidate))
         })
         .map(|(_, entry)| entry)
         .collect();
-    if approved.iter().map(|(count, _)| count).sum::<usize>() >= utterances.len() {
+    let proposals: Vec<_> = approved.into_iter().cloned().collect();
+    if removes_all_speech(&proposals, utterances) {
         return Vec::new();
     }
-    approved.into_iter().map(|(_, cut)| cut.clone()).collect()
+    proposals
+}
+
+fn removes_all_speech(proposals: &[Proposal], utterances: &[TimelineUtterance<'_>]) -> bool {
+    let covered = |speech: Range| {
+        proposals.iter().any(|proposal| {
+            proposal.remove.start <= speech.start + 0.000_001
+                && proposal.remove.end >= speech.end - 0.000_001
+        })
+    };
+    !utterances.is_empty()
+        && utterances.iter().all(|line| {
+            if line.words.is_empty() {
+                covered(line.speech)
+            } else {
+                line.words.iter().all(|word| covered(word.speech))
+            }
+        })
 }
 
 fn conflicts(left: &Proposal, right: &Proposal) -> bool {
     left.remove.overlaps(right.remove)
-        || left.keep.is_some_and(|keep| keep.overlaps(right.remove))
-        || right.keep.is_some_and(|keep| keep.overlaps(left.remove))
+        // Adjacent removals form one edit. Separated removals must not strand
+        // an audible micro-fragment between joins; preserve it for review.
+        || {
+            let gap = if left.remove.end <= right.remove.start {
+                right.remove.start - left.remove.end
+            } else { left.remove.start - right.remove.end };
+            gap > 0.000_001 && gap < 0.15 - 0.000_001
+        }
+        // Measured pause removals contain no speech. They can tighten the gaps
+        // between utterances of a retained take without deleting that take.
+        || (right.kind != "pause" && left.keep.is_some_and(|keep| keep.overlaps(right.remove)))
+        || (left.kind != "pause" && right.keep.is_some_and(|keep| keep.overlaps(left.remove)))
 }
 
 #[cfg(test)]
@@ -477,6 +558,7 @@ mod tests {
             cut_start: Some(start - 0.1),
             cut_end: Some(end + 0.1),
             text: "Spoken line",
+            words: Vec::new(),
         }
     }
 
@@ -512,6 +594,19 @@ mod tests {
     }
 
     #[test]
+    fn quiet_recording_edges_have_context_without_inventing_transcript_ids() {
+        let mut first = line(0, 0, 1.0, 2.0);
+        first.last = true;
+        let gaps = transcript_gaps(
+            [(0, Range::new(0.0, 0.85)), (0, Range::new(2.15, 3.0))],
+            &[first],
+        );
+        assert_eq!(gaps.len(), 2);
+        assert_eq!((gaps[0].before, gaps[0].after), (0, 1));
+        assert_eq!((gaps[1].before, gaps[1].after), (1, 0));
+    }
+
+    #[test]
     fn refreshed_cut_ranges_preserve_protected_gaps_and_kept_takes() {
         let lines = [
             line(0, 0, 0.5, 1.0),
@@ -524,13 +619,20 @@ mod tests {
                 first: id,
                 last: id,
             }),
+            remove_words: None,
+            keep_words: None,
             reason: "Reason".into(),
         };
         let proposals = cut_proposals(&lines, vec![choice(1, 1, Some(2)), choice(8, 8, None)]);
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].remove, Range::new(0.4, 1.1));
         assert_eq!(proposals[0].keep, Some(lines[1].speech));
-        assert!(cut_proposals(&lines, vec![choice(1, 2, None), choice(2, 3, None)]).is_empty());
+        // The second range crosses an unverified source boundary; the independent
+        // first cut is still useful and must survive.
+        assert_eq!(
+            cut_proposals(&lines, vec![choice(1, 2, None), choice(2, 3, None)]).len(),
+            1
+        );
         assert!(cut_proposals(&lines, vec![choice(1, 1, Some(2)), choice(2, 2, None)]).is_empty());
         assert!(
             cut_proposals(

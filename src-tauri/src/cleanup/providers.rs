@@ -8,6 +8,8 @@ use tauri::{AppHandle, Manager};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 
+use super::assistant::planning::{Budget, DEFAULT_CONTEXT_TOKENS, Diagnostics};
+
 const SERVICE: &str = "com.logan.tauri-app.ai-providers";
 const MAX_REPLY_BYTES: usize = 256 * 1024;
 
@@ -31,11 +33,27 @@ impl Provider {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Config {
     model: String,
     base_url: Option<String>,
+    #[serde(default = "default_context_tokens")]
+    context_window_tokens: usize,
+}
+
+fn default_context_tokens() -> usize {
+    DEFAULT_CONTEXT_TOKENS
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            base_url: None,
+            context_window_tokens: DEFAULT_CONTEXT_TOKENS,
+        }
+    }
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -67,10 +85,14 @@ pub(crate) struct Connection {
     provider: Provider,
     config: Config,
     key: Option<HeaderValue>,
+    pub(super) planning: Mutex<Diagnostics>,
 }
 
 impl Config {
     fn validate(&mut self, provider: Provider) -> Result<(), String> {
+        if !(8192..=2_000_000).contains(&self.context_window_tokens) {
+            return Err("Enter a context budget between 8,192 and 2,000,000 tokens.".into());
+        }
         self.model = self.model.trim().to_owned();
         if self.model.is_empty()
             || self.model.len() > 200
@@ -134,6 +156,13 @@ impl Config {
 
 fn credential_error() -> String {
     "The system credential store is unavailable. Unlock it and try again.".into()
+}
+
+// Audio always goes to OpenAI's fixed endpoint, independently of the planner.
+pub(super) fn openai_audio_key() -> Result<HeaderValue, String> {
+    Config::default().key(Provider::OpenAi)?.ok_or_else(|| {
+        "Save an OpenAI API key in Settings → AI providers before using API transcription.".into()
+    })
 }
 
 fn secret_header(key: &str) -> Result<HeaderValue, String> {
@@ -316,6 +345,7 @@ pub(crate) async fn connection(
             provider,
             config,
             key,
+            planning: Mutex::default(),
         })
     })
     .await
@@ -340,7 +370,7 @@ pub(crate) async fn ai_provider_test(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UtteranceRange {
     pub first: u32,
@@ -381,6 +411,7 @@ fn retake_task() -> Task<'static> {
         name: "retakes",
         instructions: INSTRUCTIONS,
         schema,
+        output_tokens: 4096,
     }
 }
 
@@ -394,26 +425,74 @@ IDs, inclusive, and a keep must never also be removed. Return only JSON in the f
 {\"retakes\":[{\"keep\":{\"first\":1,\"last\":1},\"remove\":{\"first\":2,\"last\":2}}]}. \
 Return {\"retakes\":[]} if there are no confident matches.";
 
+#[derive(Clone)]
 pub(super) struct Task<'a> {
     pub name: &'static str,
     pub instructions: &'a str,
     pub schema: Value,
+    pub output_tokens: usize,
 }
 
 impl Connection {
+    pub(super) fn budget(&self) -> Budget {
+        Budget::new(self.config.context_window_tokens)
+    }
+
+    pub(super) fn diagnostics(&self) -> Diagnostics {
+        let mut diagnostics = self.planning.lock().unwrap().clone();
+        diagnostics.provider = self.provider.account().into();
+        diagnostics.model = self.config.model.clone();
+        diagnostics
+    }
+    #[cfg(test)]
+    pub(in crate::cleanup) fn configured_for_test(path: &Path) -> Result<Self, String> {
+        let settings = load(path)?;
+        let provider = settings
+            .active
+            .ok_or("Choose an AI provider in the desktop settings.")?;
+        let mut config = settings
+            .profiles
+            .get(&provider)
+            .ok_or("No saved provider profile.")?
+            .clone();
+        if std::env::var("CUTLINE_REVIEW_EXPECT_PROVIDER")
+            .is_ok_and(|expected| expected != provider.account())
+            || std::env::var("CUTLINE_REVIEW_EXPECT_MODEL")
+                .is_ok_and(|expected| expected != config.model)
+        {
+            return Err("The saved provider or model changed. Review the destination before running this verification.".into());
+        }
+        config.validate(provider)?;
+        let key = if config.needs_key(provider) {
+            config.key(provider)?
+        } else {
+            config.key(provider).ok().flatten()
+        };
+        if key.is_none() && config.needs_key(provider) {
+            return Err("No API key is available in the credential store.".into());
+        }
+        Ok(Self {
+            provider,
+            config,
+            key,
+            planning: Mutex::default(),
+        })
+    }
+
     fn request(&self, client: &Client, input: &str, task: Task<'_>) -> reqwest::RequestBuilder {
         let model = &self.config.model;
         let Task {
             name,
             instructions,
             schema,
+            output_tokens,
         } = task;
         let (url, body) = match self.provider {
             Provider::OpenAi => (
                 "https://api.openai.com/v1/responses".into(),
                 json!({
                     "model": model, "instructions": instructions, "input": input, "store": false,
-                    "max_output_tokens": 4096,
+                    "max_output_tokens": output_tokens, "truncation": "disabled",
                     "text": {"format": {"type": "json_schema", "name": name, "strict": true, "schema": schema}}
                 }),
             ),
@@ -421,7 +500,7 @@ impl Connection {
                 "https://api.anthropic.com/v1/messages".into(),
                 json!({
                     "model": model, "system": instructions, "messages": [{"role": "user", "content": input}],
-                    "max_tokens": 4096, "output_config": {"format": {"type": "json_schema", "schema": schema}}
+                    "max_tokens": output_tokens, "output_config": {"format": {"type": "json_schema", "schema": schema}}
                 }),
             ),
             Provider::Gemini => (
@@ -430,7 +509,7 @@ impl Connection {
                 ),
                 json!({
                     "systemInstruction": {"parts": [{"text": instructions}]}, "contents": [{"parts": [{"text": input}]}],
-                    "generationConfig": {"responseMimeType": "application/json", "responseJsonSchema": schema, "maxOutputTokens": 4096}
+                    "generationConfig": {"responseMimeType": "application/json", "responseJsonSchema": schema, "maxOutputTokens": output_tokens}
                 }),
             ),
             Provider::Compatible => (
@@ -440,7 +519,7 @@ impl Connection {
                 ),
                 json!({
                     "model": model, "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": input}],
-                    "max_tokens": 4096, "stream": false
+                    "max_tokens": output_tokens, "stream": false
                 }),
             ),
         };
@@ -498,32 +577,37 @@ impl Connection {
         let client = builder
             .build()
             .map_err(|_| "Could not initialize the AI provider connection.")?;
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err("Timeline analysis cancelled.".into()),
-            result = self.send(&client, input, task) => result,
-        }
+        retry(|| self.send(&client, input, task.clone()), cancel).await
     }
 
-    async fn send(&self, client: &Client, input: &str, task: Task<'_>) -> Result<String, String> {
+    async fn send(
+        &self,
+        client: &Client,
+        input: &str,
+        task: Task<'_>,
+    ) -> Result<String, ProviderFailure> {
         let mut response = self
             .request(client, input, task)
             .send()
             .await
-            .map_err(|error| {
-                if error.is_timeout() {
+            .map_err(|error| ProviderFailure {
+                message: if error.is_timeout() {
                     "The AI provider timed out."
                 } else {
                     "Could not connect to the AI provider."
                 }
+                .into(),
+                transient: error.is_timeout() || error.is_connect(),
+                retry_after: None,
             })?;
         let status = response.status();
+        let retry_after_header = response.headers().get("retry-after").cloned();
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| "The AI provider response was interrupted.")?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|_| ProviderFailure {
+            message: "The AI provider response was interrupted.".into(),
+            transient: true,
+            retry_after: None,
+        })? {
             if bytes.len() + chunk.len() > MAX_REPLY_BYTES {
                 return Err("The AI provider returned an oversized response.".into());
             }
@@ -531,13 +615,16 @@ impl Connection {
         }
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-            return Err(match status.as_u16() {
+            let message = match status.as_u16() {
                 401 | 403 => "The AI provider rejected the API key or model access.".into(),
                 413 => "The selected model cannot fit this timeline transcript.".into(),
                 400 | 422
                     if [
                         "context_length",
                         "context window",
+                        "maximum context length",
+                        "maximum input length",
+                        "input is too long",
                         "too many tokens",
                         "input token count",
                         "prompt is too long",
@@ -549,18 +636,123 @@ impl Connection {
                 }
                 429 => "The AI provider reached a rate or quota limit.".into(),
                 404 => "The model or API endpoint was not found.".into(),
+                code if status.is_server_error() => {
+                    format!("The AI provider is temporarily unavailable (HTTP {code}).")
+                }
                 code => format!(
                     "The AI provider rejected the request (HTTP {code}). Check the model and provider settings."
                 ),
+            };
+            let retry_after = retry_after_header
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<f64>().ok())
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+            // An unsupported Retry-After date is not a license to retry earlier.
+            let understood_delay = retry_after_header.is_none() || retry_after.is_some();
+            return Err(ProviderFailure {
+                message,
+                transient: understood_delay && retryable_status(status.as_u16(), &bytes),
+                retry_after,
             });
         }
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "The AI provider returned an invalid response.")?;
-        reply_text(self.provider, &value).map(str::to_owned)
+        reply_text(self.provider, &value)
+            .map(str::to_owned)
+            .map_err(ProviderFailure::from)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ProviderFailure {
+    pub message: String,
+    pub transient: bool,
+    pub retry_after: Option<Duration>,
+}
+
+impl From<&str> for ProviderFailure {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+            retry_after: None,
+        }
+    }
+}
+
+impl From<String> for ProviderFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            transient: false,
+            retry_after: None,
+        }
+    }
+}
+
+pub(super) fn retryable_status(status: u16, body: &[u8]) -> bool {
+    if matches!(status, 408 | 409 | 500..=599) {
+        return true;
+    }
+    if status != 429 {
+        return false;
+    }
+    let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let code = value["error"]["code"].as_str().unwrap_or_default();
+    matches!(code, "rate_limit_exceeded" | "slow_down")
+        || (code.is_empty() && value["error"]["type"] == "rate_limit_error")
+}
+
+pub(super) async fn retry<F, Fut>(
+    mut operation: F,
+    cancel: &CancellationToken,
+) -> Result<String, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, ProviderFailure>>,
+{
+    let work = async {
+        for attempt in 0..3_u32 {
+            match operation().await {
+                Ok(reply) => return Ok(reply),
+                Err(failure) if failure.transient && attempt < 2 => {
+                    let jitter = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_millis()
+                        % 200;
+                    let delay = failure.retry_after.unwrap_or(Duration::from_millis(
+                        500 * 2_u64.pow(attempt) + jitter as u64,
+                    ));
+                    if delay > Duration::from_secs(30) {
+                        return Err(failure.message);
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                Err(failure) => return Err(failure.message),
+            }
+        }
+        unreachable!("bounded provider retry loop always returns")
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("Timeline analysis cancelled.".into()),
+        result = work => result,
     }
 }
 
 fn reply_text(provider: Provider, value: &Value) -> Result<&str, String> {
+    if (provider == Provider::OpenAi
+        && value["incomplete_details"]["reason"] == "max_output_tokens")
+        || (provider == Provider::Anthropic && value["stop_reason"] == "max_tokens")
+        || (provider == Provider::Gemini && value["candidates"][0]["finishReason"] == "MAX_TOKENS")
+        || (provider == Provider::Compatible && value["choices"][0]["finish_reason"] == "length")
+    {
+        return Err(
+            "The AI provider reached its output limit before completing the cut list.".into(),
+        );
+    }
     match provider {
         Provider::OpenAi if value["status"] == "completed" => value["output"]
             .as_array()
@@ -612,6 +804,153 @@ fn parse_retakes(text: &str) -> Result<Vec<Retake>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_profiles_get_an_explicit_budget_and_invalid_budgets_are_rejected() {
+        let config: Config =
+            serde_json::from_value(json!({"model":"saved-model","baseUrl":null})).unwrap();
+        assert_eq!(config.context_window_tokens, DEFAULT_CONTEXT_TOKENS);
+        let mut invalid = Config {
+            model: "saved-model".into(),
+            context_window_tokens: 0,
+            ..Config::default()
+        };
+        assert!(invalid.validate(Provider::OpenAi).is_err());
+        invalid.context_window_tokens = 128_000;
+        invalid.validate(Provider::OpenAi).unwrap();
+        let restored: Config =
+            serde_json::from_value(serde_json::to_value(&invalid).unwrap()).unwrap();
+        assert_eq!(restored.context_window_tokens, 128_000);
+    }
+
+    #[test]
+    fn distinguishes_exhausted_output_budgets_from_refused_or_malformed_replies() {
+        for (provider, value) in [
+            (
+                Provider::OpenAi,
+                json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
+            ),
+            (Provider::Anthropic, json!({"stop_reason":"max_tokens"})),
+            (
+                Provider::Gemini,
+                json!({"candidates":[{"finishReason":"MAX_TOKENS"}]}),
+            ),
+            (
+                Provider::Compatible,
+                json!({"choices":[{"finish_reason":"length"}]}),
+            ),
+        ] {
+            assert!(
+                reply_text(provider, &value)
+                    .unwrap_err()
+                    .contains("output limit")
+            );
+        }
+    }
+
+    #[test]
+    fn retries_temporary_failures_but_not_authentication_or_billing_limits() {
+        assert!(retryable_status(500, b"{}"));
+        assert!(retryable_status(503, b"{}"));
+        assert!(retryable_status(
+            429,
+            br#"{"error":{"code":"rate_limit_exceeded"}}"#
+        ));
+        assert!(!retryable_status(
+            429,
+            br#"{"error":{"code":"insufficient_quota"}}"#
+        ));
+        assert!(!retryable_status(
+            429,
+            br#"{"error":{"code":"project_spend_limit_exceeded"}}"#
+        ));
+        assert!(!retryable_status(401, b"{}"));
+        assert!(!retryable_status(413, b"{}"));
+    }
+
+    #[tokio::test]
+    async fn temporary_provider_errors_have_a_bounded_retry_budget() {
+        let mut calls = 0;
+        let reply = retry(
+            || {
+                calls += 1;
+                std::future::ready(if calls < 3 {
+                    Err(ProviderFailure {
+                        message: "temporary".into(),
+                        transient: true,
+                        retry_after: Some(Duration::ZERO),
+                    })
+                } else {
+                    Ok("recovered".into())
+                })
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, "recovered");
+        assert_eq!(calls, 3);
+        calls = 0;
+        let result = retry(
+            || {
+                calls += 1;
+                std::future::ready(Err(ProviderFailure {
+                    message: "still unavailable".into(),
+                    transient: true,
+                    retry_after: Some(Duration::ZERO),
+                }))
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(result.unwrap_err(), "still unavailable");
+    }
+
+    #[tokio::test]
+    async fn retry_waits_remain_cancellable_and_never_shorten_a_long_retry_after() {
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            signal.cancel();
+        });
+        let mut calls = 0;
+        let reply = tokio::time::timeout(
+            Duration::from_millis(200),
+            retry(
+                || {
+                    calls += 1;
+                    std::future::ready(Err(ProviderFailure {
+                        message: "temporary".into(),
+                        transient: true,
+                        retry_after: Some(Duration::from_secs(20)),
+                    }))
+                },
+                &cancel,
+            ),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+        assert_eq!(calls, 1);
+        assert!(reply.unwrap_err().contains("cancelled"));
+        calls = 0;
+        let result = retry(
+            || {
+                calls += 1;
+                std::future::ready(Err(ProviderFailure {
+                    message: "Retry later".into(),
+                    transient: true,
+                    retry_after: Some(Duration::from_secs(60)),
+                }))
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert_eq!(result.unwrap_err(), "Retry later");
+    }
+
     fn parse_reply(provider: Provider, value: &Value) -> Result<Vec<Retake>, String> {
         parse_retakes(reply_text(provider, value)?)
     }
@@ -658,8 +997,10 @@ mod tests {
                     model: "test-model".into(),
                     base_url: (provider == Provider::Compatible)
                         .then(|| "https://example.test/v1".into()),
+                    ..Config::default()
                 },
                 key: Some(secret_header("synthetic-secret").unwrap()),
+                planning: Mutex::default(),
             };
             let request = connection
                 .request(&client, transcript, retake_task())
@@ -724,8 +1065,10 @@ mod tests {
             config: Config {
                 model: "test".into(),
                 base_url: Some("http://127.0.0.1:1/v1".into()),
+                ..Config::default()
             },
             key: None,
+            planning: Mutex::default(),
         };
         let cancel = CancellationToken::new();
         assert!(

@@ -6,12 +6,14 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
     sync::OnceLock,
     time::{Duration, Instant},
 };
-use tempfile::NamedTempFile;
-use whisper_rs::{WhisperContext, WhisperContextParameters};
+use tempfile::{NamedTempFile, TempDir};
+use whisper_rs::{
+    DtwMode, DtwModelPreset, DtwParameters, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +115,20 @@ pub(super) struct Measurement {
 }
 
 // No media or transcript is written to stdout or diagnostic logs.
+fn command(request: &Request) -> Result<Command, String> {
+    let mut command = Command::new(executable(request)?);
+    command
+        .arg("--cutline-speech-worker")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    Ok(command)
+}
+
 fn request<T: DeserializeOwned>(
     request: &Request,
     control: &Control,
@@ -125,21 +141,13 @@ fn request<T: DeserializeOwned>(
         .flush()
         .map_err(|_| "Could not finish speech worker request.")?;
     let output = NamedTempFile::new().map_err(|_| "Could not create speech worker response.")?;
-    let mut command = Command::new(executable(request)?);
+    let mut command = command(request)?;
     command
-        .arg("--cutline-speech-worker")
         .arg(input.path())
         .arg(output.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
+        .stdin(Stdio::null());
     {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    {
-        let mut slot = control.child.lock().unwrap();
+        let mut slot = control.speech_child.lock().unwrap();
         control.check()?;
         if slot.is_some() {
             return Err("A speech worker is already running.".into());
@@ -152,7 +160,7 @@ fn request<T: DeserializeOwned>(
     }
     let started = Instant::now();
     let status = loop {
-        let mut slot = control.child.lock().unwrap();
+        let mut slot = control.speech_child.lock().unwrap();
         let child = slot.as_mut().ok_or("Speech worker stopped unexpectedly.")?;
         if control.cancel.is_cancelled() || started.elapsed() > timeout {
             let _ = child.kill();
@@ -186,7 +194,11 @@ fn request<T: DeserializeOwned>(
                 .into(),
         );
     }
-    let file = File::open(output.path()).map_err(|_| "Could not read speech worker response.")?;
+    read_response(output.path())
+}
+
+fn read_response<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let file = File::open(path).map_err(|_| "Could not read speech worker response.")?;
     let response: Result<T, String> = serde_json::from_reader(file.take(4 * 1024 * 1024))
         .map_err(|_| "The speech worker returned an invalid response.")?;
     response
@@ -217,41 +229,166 @@ pub(super) fn benchmark(
     )
 }
 
-pub(super) fn transcribe(
-    model: &Path,
-    pcm: &Path,
-    detected: &Detected,
-    duration: f64,
+pub(super) struct Transcriber<'a> {
+    model: &'a Path,
     device: Option<i32>,
     threads: usize,
-    control: &Control,
-) -> Result<(Vec<Utterance>, Option<String>), String> {
-    let run = |device| {
-        request(
-            &Request::Transcribe {
-                model: model.to_owned(),
-                pcm: pcm.to_owned(),
-                detected: detected.clone(),
-                duration,
-                device,
-                threads,
-            },
+    control: &'a Control,
+    process: Option<PersistentWorker<'a>>,
+}
+
+impl<'a> Transcriber<'a> {
+    pub fn new(model: &'a Path, device: Option<i32>, threads: usize, control: &'a Control) -> Self {
+        Self {
+            model,
+            device,
+            threads,
             control,
-            Duration::from_secs_f64((duration * 30.0 + 180.0).clamp(180.0, 86_400.0)),
-        )
-    };
-    match run(device) {
-        Ok(lines) => Ok((lines, None)),
-        Err(_) if device.is_some() && !control.cancel.is_cancelled() => run(None).map(|lines| {
-            (
-                lines,
-                Some(
-                    "GPU transcription failed. Continued on CPU using the same Whisper model."
-                        .into(),
-                ),
-            )
-        }),
-        Err(error) => Err(error),
+            process: None,
+        }
+    }
+
+    pub fn transcribe(
+        &mut self,
+        pcm: &Path,
+        detected: Detected,
+        duration: f64,
+    ) -> Result<(Vec<Utterance>, bool), String> {
+        if !detected.has_speech() {
+            return Ok((Vec::new(), false));
+        }
+        let mut job = Request::Transcribe {
+            model: self.model.to_owned(),
+            pcm: pcm.to_owned(),
+            detected,
+            duration,
+            device: self.device,
+            threads: self.threads,
+        };
+        let timeout = Duration::from_secs_f64((duration * 30.0 + 180.0).clamp(180.0, 86_400.0));
+        match self.run(&job, timeout) {
+            Ok(lines) => Ok((lines, false)),
+            Err(_) if self.device.is_some() && !self.control.cancel.is_cancelled() => {
+                self.process = None;
+                self.device = None;
+                if let Request::Transcribe { device, .. } = &mut job {
+                    *device = None;
+                }
+                self.run(&job, timeout).map(|lines| (lines, true))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run(&mut self, job: &Request, timeout: Duration) -> Result<Vec<Utterance>, String> {
+        if self.process.is_none() {
+            self.process = Some(PersistentWorker::start(job, self.control)?);
+        }
+        match &mut self.process {
+            Some(process) => process.transcribe(job, timeout),
+            None => request(job, self.control, timeout),
+        }
+    }
+}
+
+struct PersistentWorker<'a> {
+    folder: TempDir,
+    stdin: ChildStdin,
+    control: &'a Control,
+}
+
+impl<'a> PersistentWorker<'a> {
+    fn start(job: &Request, control: &'a Control) -> Result<Self, String> {
+        let folder =
+            tempfile::tempdir().map_err(|_| "Could not create speech worker scratch space.")?;
+        let stdin = {
+            let mut slot = control.speech_child.lock().unwrap();
+            control.check()?;
+            if slot.is_some() {
+                return Err("A speech worker is already running.".into());
+            }
+            let mut child = command(job)?
+                .arg("--session")
+                .arg(folder.path())
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(|_| "Could not start the speech worker.")?;
+            let stdin = child.stdin.take().unwrap();
+            *slot = Some(child);
+            stdin
+        };
+        let worker = Self {
+            folder,
+            stdin,
+            control,
+        };
+        worker.wait(Duration::from_secs(15))?;
+        if std::fs::read_to_string(worker.folder.path().join("protocol"))
+            .ok()
+            .as_deref()
+            != Some("2")
+        {
+            return Err(
+                "The speech worker is out of date and cannot provide word alignment.".into(),
+            );
+        }
+        Ok(worker)
+    }
+
+    fn transcribe(&mut self, job: &Request, timeout: Duration) -> Result<Vec<Utterance>, String> {
+        self.control.check()?;
+        std::fs::remove_file(self.folder.path().join("complete"))
+            .map_err(|_| "Could not reset the speech worker response.")?;
+        let input = File::create(self.folder.path().join("request.json"))
+            .map_err(|_| "Could not create speech worker request.")?;
+        serde_json::to_writer(input, job).map_err(|_| "Could not write speech worker request.")?;
+        self.stdin
+            .write_all(&[1])
+            .map_err(|_| "The speech worker stopped unexpectedly.")?;
+        self.wait(timeout)?;
+        read_response(&self.folder.path().join("response.json"))
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        let complete = self.folder.path().join("complete");
+        loop {
+            self.control.check()?;
+            if complete
+                .try_exists()
+                .map_err(|_| "Could not inspect speech worker response.")?
+            {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(
+                    "The speech worker timed out. Try CPU processing or a smaller model.".into(),
+                );
+            }
+            {
+                let mut slot = self.control.speech_child.lock().unwrap();
+                let child = slot
+                    .as_mut()
+                    .ok_or("The speech worker stopped unexpectedly.")?;
+                if child
+                    .try_wait()
+                    .map_err(|_| "Could not wait for the speech worker.")?
+                    .is_some()
+                {
+                    return Err("The speech worker stopped unexpectedly; its processing backend may be unavailable.".into());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for PersistentWorker<'_> {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.control.speech_child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -298,6 +435,19 @@ fn load(model: &Path, device: Option<i32>) -> Result<WhisperContext, String> {
     params
         .use_gpu(device.is_some())
         .gpu_device(device.unwrap_or(0));
+    let preset = match model.file_name().and_then(|name| name.to_str()) {
+        Some("ggml-small.bin") => Some(DtwModelPreset::Small),
+        Some("ggml-medium.bin") => Some(DtwModelPreset::Medium),
+        Some("ggml-large-v3-turbo.bin") => Some(DtwModelPreset::LargeV3Turbo),
+        Some("ggml-large-v3.bin") => Some(DtwModelPreset::LargeV3),
+        _ => None,
+    };
+    if let Some(model_preset) = preset {
+        params.dtw_parameters(DtwParameters {
+            mode: DtwMode::ModelPreset { model_preset },
+            ..Default::default()
+        });
+    }
     WhisperContext::new_with_params(model.to_str().ok_or("Invalid model path.")?, params).map_err(
         |_| {
             "Could not load the Whisper model. Check available memory and the processing device."
@@ -323,7 +473,16 @@ fn benchmark_samples() -> Result<Vec<f32>, String> {
     Err("The bundled speech sample is invalid.".into())
 }
 
-fn execute(request: Request) -> Result<serde_json::Value, String> {
+struct LoadedModel {
+    path: PathBuf,
+    device: Option<i32>,
+    state: WhisperState,
+}
+
+fn execute(
+    request: Request,
+    loaded: &mut Option<LoadedModel>,
+) -> Result<serde_json::Value, String> {
     whisper_rs::install_logging_hooks();
     match request {
         Request::Devices => {
@@ -387,10 +546,23 @@ fn execute(request: Request) -> Result<serde_json::Value, String> {
             device,
             threads,
         } => {
-            let model = load(&model, device)?;
             let pcm = File::open(pcm).map_err(|_| "Could not open decoded speech.")?;
+            if loaded
+                .as_ref()
+                .is_none_or(|cache| cache.path != model || cache.device != device)
+            {
+                *loaded = None;
+                let state = load(&model, device)?
+                    .create_state()
+                    .map_err(|_| "Could not initialize transcription.")?;
+                *loaded = Some(LoadedModel {
+                    path: model,
+                    device,
+                    state,
+                });
+            }
             let lines = super::audio::transcribe_local(
-                &model,
+                &mut loaded.as_mut().unwrap().state,
                 pcm,
                 &detected,
                 duration,
@@ -403,6 +575,39 @@ fn execute(request: Request) -> Result<serde_json::Value, String> {
     }
 }
 
+fn respond(input: &Path, output: &Path, loaded: &mut Option<LoadedModel>) -> Result<(), String> {
+    let file = File::open(input).map_err(|_| "Could not open speech worker request.")?;
+    let request = serde_json::from_reader(file.take(4 * 1024 * 1024))
+        .map_err(|_| "Invalid speech worker request.")?;
+    let response = execute(request, loaded);
+    let file = File::create(output).map_err(|_| "Could not open speech worker response.")?;
+    serde_json::to_writer(file, &response)
+        .map_err(|_| "Could not write speech worker response.".into())
+}
+
+fn serve(folder: &Path) -> Result<(), String> {
+    let input = folder.join("request.json");
+    let output = folder.join("response.json");
+    let complete = folder.join("complete");
+    let signal_complete =
+        || File::create(&complete).map_err(|_| "Could not signal the speech worker response.");
+    let mut loaded = None;
+    let mut stdin = std::io::stdin().lock();
+    let mut signal = [0];
+    std::fs::write(folder.join("protocol"), "2")
+        .map_err(|_| "Could not identify the speech worker protocol.")?;
+    signal_complete()?;
+    while stdin
+        .read(&mut signal)
+        .map_err(|_| "Could not receive the speech worker request.")?
+        != 0
+    {
+        respond(&input, &output, &mut loaded)?;
+        signal_complete()?;
+    }
+    Ok(())
+}
+
 /// Returns before starting Tauri when invoked as a worker.
 pub(crate) fn run_if_requested() -> bool {
     let args: Vec<_> = std::env::args_os().collect();
@@ -412,25 +617,13 @@ pub(crate) fn run_if_requested() -> bool {
     {
         return false;
     }
-    let result = (|| {
-        if args.len() != 4 {
-            return Err("Invalid speech worker arguments.".to_owned());
-        }
-        let input = File::open(&args[2]).map_err(|_| "Could not open speech worker request.")?;
-        let request = serde_json::from_reader(input.take(4 * 1024 * 1024))
-            .map_err(|_| "Invalid speech worker request.")?;
-        Ok((PathBuf::from(&args[3]), execute(request)))
-    })();
-    match result {
-        Ok((output, response)) => {
-            if File::create(output)
-                .ok()
-                .is_none_or(|file| serde_json::to_writer(file, &response).is_err())
-            {
-                std::process::exit(1);
-            }
-        }
-        Err(_) => std::process::exit(1),
+    let result = match args.as_slice() {
+        [_, _, mode, folder] if mode == "--session" => serve(Path::new(folder)),
+        [_, _, input, output] => respond(Path::new(input), Path::new(output), &mut None),
+        _ => Err("Invalid speech worker arguments.".into()),
+    };
+    if result.is_err() {
+        std::process::exit(1);
     }
     true
 }
@@ -462,22 +655,31 @@ mod tests {
             "duration": 8.0, "speech": [{"start": 0.0, "end": 8.0}], "quiet": []
         }))
         .unwrap();
-        let (lines, notice) = transcribe(
-            &model,
-            pcm.path(),
-            &detected,
-            8.0,
-            Some(i32::MAX),
-            8,
-            &Control::default(),
-        )
-        .unwrap();
-        assert!(notice.unwrap().contains("same Whisper model"));
+        let control = Control::default();
+        let mut transcriber = Transcriber::new(&model, Some(i32::MAX), 8, &control);
+        let (lines, fallback) = transcriber
+            .transcribe(pcm.path(), detected.clone(), 8.0)
+            .unwrap();
+        assert!(fallback);
         assert!(
             lines
                 .iter()
                 .any(|line| line.text.to_lowercase().contains("country"))
         );
+        assert!(
+            lines.iter().map(|line| line.words.len()).sum::<usize>() >= 8,
+            "The current speech worker must return real word timing."
+        );
+        let pid = control.speech_child.lock().unwrap().as_ref().unwrap().id();
+        let (repeated, fallback) = transcriber.transcribe(pcm.path(), detected, 8.0).unwrap();
+        assert!(!fallback);
+        assert_eq!(
+            control.speech_child.lock().unwrap().as_ref().unwrap().id(),
+            pid
+        );
+        assert_eq!(repeated[0].text, lines[0].text);
+        drop(transcriber);
+        assert!(control.speech_child.lock().unwrap().is_none());
     }
 
     #[test]
@@ -488,12 +690,12 @@ mod tests {
         let child_control = control.clone();
         let task = std::thread::spawn(move || benchmark(&model, None, 2, &child_control));
         let started = Instant::now();
-        while control.child.lock().unwrap().is_none() {
+        while control.speech_child.lock().unwrap().is_none() {
             assert!(started.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(10));
         }
         control.stop();
         assert!(task.join().unwrap().is_err());
-        assert!(control.child.lock().unwrap().is_none());
+        assert!(control.speech_child.lock().unwrap().is_none());
     }
 }

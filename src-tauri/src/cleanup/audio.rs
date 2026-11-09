@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperVadContext, WhisperVadContextParams,
+    FullParams, SamplingStrategy, WhisperState, WhisperVadContext, WhisperVadContextParams,
     WhisperVadParams,
 };
 
@@ -21,18 +21,23 @@ const OVERLAP: usize = RATE;
 const ENERGY_BIN: usize = RATE / 50;
 const FRAME_BYTES: usize = 4;
 const BOUNDARY_PADDING: f64 = 0.15;
+const MIN_QUIET_GAP: f64 = 0.5;
+const TIME_EPSILON: f64 = 0.000_001;
 
 #[derive(Default)]
 pub(super) struct Control {
     pub cancel: CancellationToken,
     pub(super) child: Mutex<Option<Child>>,
+    pub(super) speech_child: Mutex<Option<Child>>,
 }
 
 impl Control {
     pub fn stop(&self) {
         self.cancel.cancel();
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.kill();
+        for slot in [&self.child, &self.speech_child] {
+            if let Some(child) = slot.lock().unwrap().as_mut() {
+                let _ = child.kill();
+            }
         }
     }
 
@@ -48,11 +53,9 @@ impl Control {
 pub(super) struct Analysis {
     pub pauses: Vec<Range>,
     pub utterances: Vec<Utterance>,
-    pub transcript_issue: Option<String>,
-    pub runtime_notice: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Utterance {
     pub speech: Range,
     pub start: Option<f64>,
@@ -60,13 +63,25 @@ pub(super) struct Utterance {
     pub ordinal: usize,
     pub last: bool,
     pub text: String,
+    #[serde(default)]
+    pub words: Vec<Word>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct Word {
+    pub speech: Range,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Range>,
 }
 
 pub(super) struct Engine {
     vad: WhisperVadContext,
-    whisper: Option<PathBuf>,
-    pub(super) device: Option<i32>,
-    pub(super) threads: usize,
+}
+
+pub(super) struct PreparedAudio {
+    pub detected: Detected,
+    pub pcm: Option<NamedTempFile>,
 }
 
 impl Engine {
@@ -78,33 +93,19 @@ impl Engine {
         params.set_n_threads(1);
         let vad = WhisperVadContext::new(model_path(vad_path)?, params)
             .map_err(|_| "Could not load the local voice detector.")?;
-        Ok(Self {
-            vad,
-            whisper: None,
-            device: None,
-            threads: 4,
-        })
+        Ok(Self { vad })
     }
 
-    pub fn load_whisper(&mut self, path: &Path) -> Result<(), String> {
-        self.whisper = Some(path.to_owned());
-        Ok(())
-    }
-
-    pub fn stop_transcription(&mut self) {
-        self.whisper = None;
-    }
-
-    pub fn analyze(
+    pub fn prepare(
         &mut self,
         decoder: &Path,
         media: &Path,
         range: Range,
-        pauses: bool,
+        transcribe: bool,
         control: &Control,
         mut progress: impl Fn(f64),
-    ) -> Result<Analysis, String> {
-        let mut pcm = if self.whisper.is_some() {
+    ) -> Result<PreparedAudio, String> {
+        let mut pcm = if transcribe {
             Some(BufWriter::new(NamedTempFile::new().map_err(
                 |_| "Could not create speech analysis scratch space.",
             )?))
@@ -181,33 +182,11 @@ impl Engine {
         if !status.is_ok_and(|status| status.success()) || detected.duration <= 0.0 {
             return Err("No readable audio was found in this timeline range.".into());
         }
-        let mut result = Analysis::default();
-        if let (Some(whisper), Some(pcm)) = (&self.whisper, pcm) {
-            let pcm = pcm
-                .into_inner()
-                .map_err(|_| "Could not finish writing speech analysis scratch space.")?;
-            match super::worker::transcribe(
-                whisper,
-                pcm.path(),
-                &detected,
-                range.duration(),
-                self.device,
-                self.threads,
-                control,
-            ) {
-                Ok((utterances, notice)) => {
-                    result.utterances = utterances;
-                    result.runtime_notice = notice;
-                }
-                Err(error) => result.transcript_issue = Some(error),
-            }
-            progress(1.0);
-        }
-        control.check()?;
-        if pauses {
-            result.pauses = detected.pauses();
-        }
-        Ok(result)
+        let pcm = pcm
+            .map(BufWriter::into_inner)
+            .transpose()
+            .map_err(|_| "Could not finish writing speech analysis scratch space.")?;
+        Ok(PreparedAudio { detected, pcm })
     }
 
     fn detect(
@@ -277,11 +256,7 @@ impl Engine {
                 }
             }
             let decoded = (seconds(frames_read) / duration).min(1.0);
-            progress(if pcm.is_some() {
-                decoded * 0.35
-            } else {
-                decoded
-            });
+            progress(decoded);
             if final_window {
                 break;
             }
@@ -327,7 +302,7 @@ fn sample(bytes: &[u8]) -> f32 {
     i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0
 }
 
-fn mono(bytes: &[u8]) -> Vec<f32> {
+pub(super) fn mono(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(FRAME_BYTES)
         .map(|frame| {
@@ -377,12 +352,120 @@ pub(super) struct Detected {
 }
 
 impl Detected {
-    fn pauses(&self) -> Vec<Range> {
-        self.speech
-            .windows(2)
-            .filter_map(|speech| {
-                let gap = Range::new(speech[0].end, speech[1].start);
-                if gap.duration() < 0.8 {
+    pub fn reuse(
+        &self,
+        duration: f64,
+        trim: Option<Range>,
+        lines: &[Utterance],
+        pauses: bool,
+    ) -> Option<Analysis> {
+        let Some(trim) = trim else {
+            return Some(Analysis {
+                pauses: if pauses { self.pauses() } else { Vec::new() },
+                // Boundaries are derived evidence, not transcript data. Recompute them
+                // even for an exact cache hit so fixes also apply to saved projects.
+                utterances: lines
+                    .iter()
+                    .map(|line| Utterance {
+                        start: self.before(line.speech.start),
+                        end: self.after(line.speech.end, duration),
+                        ..line.clone()
+                    })
+                    .collect(),
+            });
+        };
+        // Only reuse whole speech groups. A clip boundary through a group could
+        // leave words in the transcript that are absent from the edited audio.
+        if trim.start < 0.0 || trim.end > self.duration + TIME_EPSILON {
+            return None;
+        }
+        let is_quiet = |point| {
+            self.quiet
+                .iter()
+                .any(|range| range.start <= point && point <= range.end)
+        };
+        if (trim.start > 0.0 && !is_quiet(trim.start))
+            || (trim.end < self.duration && !is_quiet(trim.end))
+        {
+            return None;
+        }
+        let groups = self.utterance_groups();
+        let first = groups.partition_point(|group| group.end <= trim.start);
+        let end = groups.partition_point(|group| group.start < trim.end);
+        if groups
+            .get(first..end)?
+            .iter()
+            .any(|group| group.start < trim.start || group.end > trim.end)
+        {
+            return None;
+        }
+        let slice = |ranges: &[Range]| {
+            ranges
+                .iter()
+                .filter(|range| range.overlaps(trim))
+                .map(|range| {
+                    Range::new(range.start.max(trim.start), range.end.min(trim.end))
+                        .offset(-trim.start)
+                })
+                .collect()
+        };
+        let detected = Self {
+            duration: self.duration.min(trim.end) - trim.start,
+            speech: slice(&self.speech),
+            quiet: slice(&self.quiet),
+        };
+        Some(Analysis {
+            pauses: if pauses {
+                detected.pauses()
+            } else {
+                Vec::new()
+            },
+            utterances: lines
+                .iter()
+                .filter(|line| (first..end).contains(&line.ordinal))
+                .map(|line| {
+                    let speech = line.speech.offset(-trim.start);
+                    Utterance {
+                        speech,
+                        start: detected.before(speech.start),
+                        end: detected.after(speech.end, duration),
+                        ordinal: line.ordinal - first,
+                        last: line.ordinal + 1 == end,
+                        text: line.text.clone(),
+                        words: line
+                            .words
+                            .iter()
+                            .map(|word| Word {
+                                speech: word.speech.offset(-trim.start),
+                                text: word.text.clone(),
+                                anchor: word.anchor.map(|range| range.offset(-trim.start)),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    pub fn cache_size(&self) -> usize {
+        (self.speech.len() + self.quiet.len()).saturating_mul(80)
+    }
+
+    pub fn has_speech(&self) -> bool {
+        !self.speech.is_empty()
+    }
+
+    pub fn pauses(&self) -> Vec<Range> {
+        let mut gaps = Vec::with_capacity(self.speech.len() + 1);
+        let mut cursor = 0.0;
+        for speech in &self.speech {
+            gaps.push(Range::new(cursor, speech.start));
+            cursor = speech.end;
+        }
+        gaps.push(Range::new(cursor, self.duration));
+        gaps.into_iter()
+            .filter_map(|gap| {
+                if gap.duration() + TIME_EPSILON < MIN_QUIET_GAP {
                     return None;
                 }
                 // Use the quiet interval through the middle of the gap. The detector can
@@ -398,16 +481,36 @@ impl Detected {
                     return None;
                 }
                 let gap = Range::new(gap.start.max(quiet.start), gap.end.min(quiet.end));
-                (gap.duration() >= 0.8).then_some(Range::new(
-                    gap.start + BOUNDARY_PADDING,
-                    gap.end - BOUNDARY_PADDING,
+                (gap.duration() + TIME_EPSILON >= MIN_QUIET_GAP).then_some(Range::new(
+                    gap.start
+                        + if gap.start <= TIME_EPSILON {
+                            0.0
+                        } else {
+                            BOUNDARY_PADDING
+                        },
+                    gap.end
+                        - if self.duration - gap.end <= TIME_EPSILON {
+                            0.0
+                        } else {
+                            BOUNDARY_PADDING
+                        },
                 ))
             })
             .collect()
     }
 
     fn before(&self, speech_start: f64) -> Option<f64> {
-        if speech_start <= BOUNDARY_PADDING {
+        if speech_start <= BOUNDARY_PADDING + TIME_EPSILON {
+            return Some(0.0);
+        }
+        // A pause cut can leave 150–190 ms at a clip edge after VAD quantization.
+        // Use that existing edge when the entire lead-in is measured quiet,
+        // rather than rejecting it for leaving a sub-frame sliver of silence.
+        if speech_start <= BOUNDARY_PADDING + 0.04 + TIME_EPSILON
+            && self.quiet.first().is_some_and(|quiet| {
+                quiet.start <= TIME_EPSILON && quiet.end + TIME_EPSILON >= speech_start
+            })
+        {
             return Some(0.0);
         }
         self.quiet[..self
@@ -423,7 +526,15 @@ impl Detected {
     }
 
     fn after(&self, speech_end: f64, source_duration: f64) -> Option<f64> {
-        if source_duration - speech_end <= BOUNDARY_PADDING {
+        if source_duration - speech_end <= BOUNDARY_PADDING + TIME_EPSILON {
+            return Some(source_duration);
+        }
+        if source_duration - speech_end <= BOUNDARY_PADDING + 0.04 + TIME_EPSILON
+            && self.quiet.last().is_some_and(|quiet| {
+                quiet.start <= speech_end + TIME_EPSILON
+                    && quiet.end + TIME_EPSILON >= source_duration
+            })
+        {
             return Some(source_duration);
         }
         self.quiet[self.quiet.partition_point(|quiet| quiet.end <= speech_end)..]
@@ -435,7 +546,7 @@ impl Detected {
             })
     }
 
-    fn utterance_groups(&self) -> Vec<Range> {
+    pub(super) fn utterance_groups(&self) -> Vec<Range> {
         let mut groups: Vec<Range> = Vec::new();
         for speech in &self.speech {
             if let Some(group) = groups.last_mut()
@@ -448,10 +559,63 @@ impl Detected {
         }
         groups
     }
+
+    /// Attach provider words to the same measured speech groups used by local
+    /// transcription and cache trimming. Missing groups retain ordinal gaps.
+    pub(super) fn api_utterances(&self, words: Vec<Word>) -> Result<Vec<Utterance>, String> {
+        let groups = self.utterance_groups();
+        let mut grouped = vec![Vec::new(); groups.len()];
+        for word in words {
+            let middle = (word.speech.start + word.speech.end) * 0.5;
+            let (index, distance) = groups
+                .iter()
+                .enumerate()
+                .map(|(index, group)| {
+                    (
+                        index,
+                        (group.start - middle).max(middle - group.end).max(0.0),
+                    )
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .ok_or("OpenAI returned words outside detected speech.")?;
+            if distance > 0.5 {
+                return Err("OpenAI word timing disagrees with the detected speech. This source needs review.".into());
+            }
+            grouped[index].push(word);
+        }
+        let mut utterances = Vec::new();
+        for (ordinal, words) in grouped.into_iter().enumerate() {
+            // Never treat untranscribed detected speech as reviewed material.
+            if words.is_empty() {
+                return Err(
+                    "OpenAI omitted a detected speech passage. This source was left for review."
+                        .into(),
+                );
+            }
+            let speech = Range::new(
+                groups[ordinal].start.min(words[0].speech.start),
+                groups[ordinal].end.max(words.last().unwrap().speech.end),
+            );
+            utterances.push(Utterance {
+                speech,
+                start: self.before(speech.start),
+                end: self.after(speech.end, self.duration),
+                ordinal,
+                last: ordinal + 1 == groups.len(),
+                text: words
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                words,
+            });
+        }
+        Ok(utterances)
+    }
 }
 
 pub(super) fn transcribe_local(
-    whisper: &WhisperContext,
+    state: &mut WhisperState,
     mut pcm: std::fs::File,
     detected: &Detected,
     source_duration: f64,
@@ -459,9 +623,6 @@ pub(super) fn transcribe_local(
     progress: &mut impl Fn(f64),
     threads: usize,
 ) -> Result<Vec<Utterance>, String> {
-    let mut state = whisper
-        .create_state()
-        .map_err(|_| "Could not initialize transcription.")?;
     let mut utterances = Vec::new();
     let mut bytes = Vec::new();
     let mut text_bytes = 0;
@@ -473,6 +634,7 @@ pub(super) fn transcribe_local(
         pcm.seek(SeekFrom::Start((start * FRAME_BYTES) as u64))
             .map_err(|_| "Could not seek in decoded speech.")?;
         let mut text = String::new();
+        let mut words = Vec::new();
         while start < end {
             control.check()?;
             let count = (end - start).min(WINDOW);
@@ -491,10 +653,49 @@ pub(super) fn transcribe_local(
                         text.push(' ');
                     }
                     text.push_str(part.trim());
-                    if text_bytes + text.len() > super::TRANSCRIPT_LIMIT {
-                        return Err(super::TRANSCRIPT_TOO_LARGE.into());
+                    if text_bytes + text.len() > super::LOCAL_TRANSCRIPT_LIMIT {
+                        return Err(super::LOCAL_TRANSCRIPT_TOO_LARGE.into());
                     }
                 }
+                let mut bytes = Vec::new();
+                let mut timing: Option<Range> = None;
+                let mut anchor: Option<Range> = None;
+                for index in 0..segment.n_tokens() {
+                    let Some(token) = segment.get_token(index) else {
+                        continue;
+                    };
+                    let Ok(part) = token.to_bytes() else {
+                        continue;
+                    };
+                    if part.starts_with(b"[_") {
+                        continue;
+                    }
+                    if part.first().is_some_and(u8::is_ascii_whitespace) && !bytes.is_empty() {
+                        push_word(&mut words, &mut bytes, timing.take(), anchor.take());
+                    }
+                    bytes.extend_from_slice(part);
+                    let data = token.token_data();
+                    if data.t_dtw >= 0 {
+                        let time = seconds(start) + data.t_dtw as f64 / 100.0;
+                        if let Some(anchor) = &mut anchor {
+                            anchor.end = anchor.end.max(time);
+                        } else {
+                            anchor = Some(Range::new(time, time));
+                        }
+                    }
+                    if data.t0 >= 0 && data.t1 >= data.t0 {
+                        let token_time = Range::new(
+                            seconds(start) + data.t0 as f64 / 100.0,
+                            seconds(start) + data.t1 as f64 / 100.0,
+                        );
+                        if let Some(timing) = &mut timing {
+                            timing.end = timing.end.max(token_time.end);
+                        } else {
+                            timing = Some(token_time);
+                        }
+                    }
+                }
+                push_word(&mut words, &mut bytes, timing, anchor);
             }
             start += count;
             progress(0.35 + 0.65 * seconds(start) / detected.duration);
@@ -505,6 +706,7 @@ pub(super) fn transcribe_local(
         text_bytes += text.len();
         let start = detected.before(speech.start);
         let end = detected.after(speech.end, source_duration);
+        align_words(&mut words, speech);
         utterances.push(Utterance {
             speech,
             start,
@@ -512,9 +714,67 @@ pub(super) fn transcribe_local(
             ordinal,
             last: ordinal + 1 == group_count,
             text,
+            words,
         });
     }
     Ok(utterances)
+}
+
+fn push_word(
+    words: &mut Vec<Word>,
+    bytes: &mut Vec<u8>,
+    timing: Option<Range>,
+    anchor: Option<Range>,
+) {
+    let text = String::from_utf8_lossy(bytes).trim().to_owned();
+    if !text.is_empty()
+        && !text.chars().any(char::is_alphanumeric)
+        && let Some(previous) = words.last_mut()
+    {
+        previous.text.push_str(&text);
+        bytes.clear();
+        return;
+    }
+    if !text.is_empty()
+        && let Some(speech) = timing
+    {
+        words.push(Word {
+            speech,
+            text,
+            anchor,
+        });
+    }
+    bytes.clear();
+}
+
+fn align_words(words: &mut [Word], speech: Range) {
+    let anchors: Option<Vec<_>> = words.iter().map(|word| word.anchor).collect();
+    let Some(anchors) = anchors else {
+        return;
+    };
+    if anchors.is_empty()
+        || anchors
+            .iter()
+            .any(|range| range.start < speech.start - 0.2 || range.end > speech.end + 0.2)
+        || anchors
+            .windows(2)
+            .any(|pair| pair[0].end > pair[1].start + TIME_EPSILON)
+    {
+        return;
+    }
+    for (index, word) in words.iter_mut().enumerate() {
+        let start = if index == 0 {
+            speech.start
+        } else {
+            (anchors[index - 1].end + anchors[index].start) * 0.5
+        };
+        let end = if index + 1 == anchors.len() {
+            speech.end
+        } else {
+            (anchors[index].end + anchors[index + 1].start) * 0.5
+        };
+        word.speech = Range::new(start.max(speech.start), end.min(speech.end));
+    }
 }
 
 pub(super) fn transcription_params(samples: usize, threads: usize) -> FullParams<'static, 'static> {
@@ -524,6 +784,7 @@ pub(super) fn transcription_params(samples: usize, threads: usize) -> FullParams
     // Match benchmark and real transcription, including encoder context and language detection.
     params.set_audio_ctx(((samples.div_ceil(RATE / 50) + 50).clamp(384, 1500)) as i32);
     params.set_no_context(true);
+    params.set_token_timestamps(true);
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -536,7 +797,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shortens_only_quiet_interior_pauses() {
+    fn shortens_quiet_gaps_including_recording_edges() {
         let mut detected = Detected {
             duration: 9.0,
             speech: vec![
@@ -555,12 +816,73 @@ mod tests {
         };
         assert_eq!(
             detected.pauses(),
-            vec![Range::new(2.05 + 0.15, 2.95 - 0.15)]
+            vec![
+                Range::new(0.0, 0.85),
+                Range::new(2.05 + 0.15, 2.95 - 0.15),
+                Range::new(6.15, 6.6 - 0.15),
+                Range::new(7.15, 9.0),
+            ]
         );
-        let pause = detected.pauses()[0];
+        let pause = detected.pauses()[1];
         assert_eq!(detected.after(2.0, detected.duration), Some(pause.start));
         assert_eq!(detected.before(3.0), Some(pause.end));
         detected.speech.clear();
+        assert!(detected.pauses().is_empty());
+    }
+
+    #[test]
+    fn quiet_clip_edges_remain_cuttable_after_pause_cleanup() {
+        let detected: Detected = serde_json::from_value(serde_json::json!({
+            "duration": 3.2,
+            "speech": [{"start": 0.16, "end": 3.03}],
+            "quiet": [{"start": 0.0, "end": 0.16}, {"start": 3.03, "end": 3.2}]
+        }))
+        .unwrap();
+        assert_eq!(detected.before(0.16), Some(0.0));
+        assert_eq!(detected.after(3.03, 3.2), Some(3.2));
+        // Silence retained by the first cleanup is not shortened again.
+        assert!(detected.pauses().is_empty());
+
+        let audible: Detected = serde_json::from_value(serde_json::json!({
+            "duration": 3.2,
+            "speech": [{"start": 0.16, "end": 3.03}],
+            "quiet": [{"start": 0.1, "end": 0.16}, {"start": 3.03, "end": 3.1}]
+        }))
+        .unwrap();
+        assert_eq!(audible.before(0.16), None);
+        assert_eq!(audible.after(3.03, 3.2), None);
+    }
+
+    #[test]
+    fn exact_cache_hits_refresh_old_missing_boundaries() {
+        let detected: Detected = serde_json::from_value(serde_json::json!({
+            "duration": 6.07,
+            "speech": [{"start": 1.66, "end": 5.92}],
+            "quiet": [{"start": 0.0, "end": 1.66}, {"start": 5.74, "end": 6.07}]
+        }))
+        .unwrap();
+        let old = Utterance {
+            speech: Range::new(1.66, 5.92),
+            start: Some(1.51),
+            end: None,
+            ordinal: 0,
+            last: true,
+            text: "Recording count-in".into(),
+            words: Vec::new(),
+        };
+        let result = detected.reuse(6.07, None, &[old], true).unwrap();
+        assert_eq!(result.utterances[0].end, Some(6.07));
+        assert_eq!(result.utterances[0].text, "Recording count-in");
+    }
+
+    #[test]
+    fn a_fully_quiet_source_is_a_candidate_but_audible_non_speech_is_not() {
+        let mut detected: Detected = serde_json::from_value(serde_json::json!({
+            "duration": 3.0, "speech": [], "quiet": [{"start": 0.0, "end": 3.0}]
+        }))
+        .unwrap();
+        assert_eq!(detected.pauses(), vec![Range::new(0.0, 3.0)]);
+        detected.quiet.clear();
         assert!(detected.pauses().is_empty());
     }
 
@@ -582,9 +904,6 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let media = work.path().join("offset.mp4");
         let mut engine = Engine::new(&fixture.join("ggml-silero-v5.1.2.bin")).unwrap();
-        engine
-            .load_whisper(&fixture.join("ggml-small.bin"))
-            .unwrap();
         let status = Command::new(&ffmpeg)
             .args([
                 "-v",
@@ -621,38 +940,34 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let control = Control::default();
-        let result = engine
-            .analyze(
-                &ffmpeg,
-                &media,
-                Range::new(0.5, 25.5),
-                true,
-                &control,
-                |_| {},
+        let range = Range::new(0.5, 25.5);
+        let prepared = engine
+            .prepare(&ffmpeg, &media, range, true, &control, |_| {})
+            .unwrap();
+        let pauses = prepared.detected.pauses();
+        let model = fixture.join("ggml-small.bin");
+        let (utterances, _) = super::super::worker::Transcriber::new(&model, None, 8, &control)
+            .transcribe(
+                prepared.pcm.unwrap().path(),
+                prepared.detected,
+                range.duration(),
             )
             .unwrap();
         assert!(
-            result.transcript_issue.is_none(),
-            "{:?}",
-            result.transcript_issue
-        );
-        assert!(
-            result
-                .pauses
+            pauses
                 .iter()
                 .any(|gap| gap.start > 10.0 && gap.start < 13.0 && gap.end > 12.0),
             "The intended gap was missing: {:?}",
-            result.pauses
+            pauses
         );
-        let transcript = result
-            .utterances
+        let transcript = utterances
             .iter()
             .map(|unit| unit.text.as_str())
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
         assert!(transcript.matches("country").count() >= 4, "{transcript}");
-        let first = result.utterances.first().unwrap();
+        let first = utterances.first().unwrap();
         assert!(
             first.speech.start >= 0.4 && first.speech.start <= 1.5,
             "First speech at {:?}",
@@ -661,7 +976,7 @@ mod tests {
         control.stop();
         assert!(
             engine
-                .analyze(
+                .prepare(
                     &ffmpeg,
                     &media,
                     Range::new(0.0, 3.0),
