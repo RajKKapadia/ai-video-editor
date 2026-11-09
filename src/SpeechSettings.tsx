@@ -18,19 +18,19 @@ export function Settings({ initialTab }: { initialTab: 'speech' | 'providers' })
 
 function SpeechSettings() {
   const [status, setStatus] = useState<SpeechStatus | null>(null);
-  const [config, setConfig] = useState<SpeechConfig>({ preference: 'autoBalanced', processing: 'auto' });
+  const [config, setConfig] = useState<SpeechConfig>({ engine: 'local', preference: 'autoBalanced', processing: 'auto' });
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<CleanupProgress | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const mounted = useRef(true);
   const preparing = useRef(false);
-  const changed = status && (status.config.preference !== config.preference || status.config.processing !== config.processing);
+  const changed = status && ((status.config.engine ?? 'local') !== config.engine || status.config.preference !== config.preference || status.config.processing !== config.processing);
 
   useEffect(() => {
     mounted.current = true;
     void invoke<SpeechStatus>('speech_status').then((saved) => {
-      if (mounted.current) { setStatus(saved); setConfig(saved.config); }
+      if (mounted.current) { setStatus(saved); setConfig({ ...saved.config, engine: saved.config.engine ?? 'local' }); }
     }).catch((error) => {
       if (mounted.current) setError(errorMessage(error, 'Could not inspect transcription settings.'));
     });
@@ -44,7 +44,7 @@ function SpeechSettings() {
     setBusy(true); setError(''); setNotice('');
     try {
       const saved = await action();
-      if (mounted.current) { setStatus(saved); setConfig(saved.config); setNotice(message); }
+      if (mounted.current) { setStatus(saved); setConfig({ ...saved.config, engine: saved.config.engine ?? 'local' }); setNotice(message); }
     } catch (error) {
       if (mounted.current) setError(errorMessage(error, 'Could not update transcription settings.'));
     } finally {
@@ -71,10 +71,20 @@ function SpeechSettings() {
     event.preventDefault();
     void run(() => invoke<SpeechStatus>('speech_save', { config }), 'Transcription preferences saved.');
   }}>
-    <p className="modal-intro">Transcribe on this device. Auto recommends a model for your hardware; choosing a model keeps it fixed when processing falls back to CPU.</p>
+    <p className="modal-intro">Choose where to transcribe your audio. Word timings and transcripts are saved in your project workspace for reuse.</p>
     <fieldset className="provider-fields" disabled={!status || busy}>
+      <label className="field">Transcription engine
+        <select aria-label="Transcription engine" autoFocus value={config.engine} onChange={(event) => setConfig({ ...config, engine: event.target.value as SpeechConfig['engine'] })}>
+          <option value="local">Local Whisper · on this device</option>
+          <option value="openAi">OpenAI API · word timestamps</option>
+        </select>
+      </label>
+      {config.engine === 'openAi' ? <>
+        <p className="provider-note">Uses your saved OpenAI key from AI providers. Audio is uploaded to OpenAI for transcription; usage is billed to your account. Local voice detection checks speech boundaries.</p>
+        <p className="provider-note">Model: whisper-1. OpenAI currently documents word timestamps for this model, with shutdown scheduled for February 26, 2027. A replacement will be needed before that date.</p>
+      </> : <>
       <label className="field">Transcription model
-        <select autoFocus value={config.preference} onChange={(event) => setConfig({ ...config, preference: event.target.value as SpeechConfig['preference'] })}>
+        <select aria-label="Local transcription model" value={config.preference} onChange={(event) => setConfig({ ...config, preference: event.target.value as SpeechConfig['preference'] })}>
           <option value="autoBalanced">Auto · balanced</option>
           <option value="autoAccuracy">Auto · prioritize accuracy</option>
           {Object.entries(whisperModels).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
@@ -86,8 +96,9 @@ function SpeechSettings() {
           <option value="cpu">CPU</option>
         </select>
       </label>
+      </>}
     </fieldset>
-    {status && selection && <section className="speech-summary" aria-label="Transcription recommendation">
+    {config.engine === 'local' && status && selection && <section className="speech-summary" aria-label="Transcription recommendation">
       <strong>{whisperModels[selection.model]}</strong>
       <p>{selection.device?.name ?? 'CPU processing'} · {model ? gibibytes(model.downloadBytes) + ' model download' : ''}{model?.downloaded ? ' · downloaded' : ''}</p>
       <p>{selection.reason}</p>
@@ -104,8 +115,8 @@ function SpeechSettings() {
     {progress && <div className="cleanup-progress"><p role="status">{progress.stage}</p><progress aria-label="Speech model preparation" max={1} value={progress.fraction ?? undefined} /></div>}
     <div className="provider-actions">
       {busy && preparing.current ? <button className="button secondary" type="button" onClick={() => void invoke('speech_cancel').catch(() => {})}>Cancel preparation</button> : <>
-        <button className="button secondary" type="button" disabled={busy || !!changed} onClick={() => void run(() => invoke<SpeechStatus>('speech_status', { recheck: true }), 'Hardware checked. The next test will measure current performance.')}>Refresh hardware</button>
-        <button className="button secondary" type="button" disabled={!status || busy || !!changed} onClick={() => void run(prepare, 'Model verified and transcription test completed.')}>Download and test</button>
+        {config.engine === 'local' && <><button className="button secondary" type="button" disabled={busy || !!changed} onClick={() => void run(() => invoke<SpeechStatus>('speech_status', { recheck: true }), 'Hardware checked. The next test will measure current performance.')}>Refresh hardware</button>
+        <button className="button secondary" type="button" disabled={!status || busy || !!changed} onClick={() => void run(prepare, 'Model verified and transcription test completed.')}>Download and test</button></>}
         <button className="button primary" type="submit" disabled={!status || busy || !changed}>Save and use</button>
       </>}
     </div>

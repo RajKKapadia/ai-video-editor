@@ -14,7 +14,24 @@ export type CleanupProposal = {
   reason?: string;
 };
 export type AssistantMessage = { id: number; role: 'user' | 'assistant'; text: string };
+export type PlanningDiagnostics = {
+  strategy: 'fullTimeline' | 'sections';
+  provider?: string;
+  model?: string;
+  timelineKey: string;
+  totalUtterances: number;
+  reviewedUtterances: number;
+  contextBudgetTokens: number;
+  outputBudgetTokens: number;
+  fallbackReason: string | null;
+  reviews: {
+    scope: string; start: number; end: number; utterances: number;
+    completed: boolean; error: string | null; edits: number;
+    passes: { inputBytes: number; estimatedInputTokens: number; response: unknown; validation: string }[];
+  }[];
+};
 export type CleanupReport = {
+  processingDevice?: string | null;
   proposals: CleanupProposal[];
   retakeIssue: string | null;
   transcriptCacheIssue: string | null;
@@ -25,6 +42,7 @@ export type CleanupReport = {
   draftSummary?: string;
   reviewNotes?: string[];
   canClearTimeline?: boolean;
+  planning?: PlanningDiagnostics;
 };
 
 export function canPreviewCleanupDraft(timeline: Segment[], report: CleanupReport) {

@@ -6,6 +6,7 @@ import {
   errorMessage, providers,
   type AssistantRequest, type CleanupProgress, type ProviderStatus,
 } from './cleanupNative';
+import type { SpeechStatus } from './speechNative';
 import type { AssistantMessage, CleanupReport } from './cleanupTimeline';
 
 type Props = {
@@ -31,6 +32,7 @@ export function AssistantPanel({
   messages, review, onRun, onApplyPauses, onCancel, onClose, onSettings,
 }: Props) {
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
+  const [speech, setSpeech] = useState<SpeechStatus | null>(null);
   const [providerError, setProviderError] = useState('');
   const [saved, setSaved] = useState<AssistantMessage[]>([]);
   const [historyError, setHistoryError] = useState('');
@@ -39,6 +41,7 @@ export function AssistantPanel({
 
   useEffect(() => {
     let current = true;
+    void invoke<SpeechStatus>('speech_status').then((saved) => { if (current) setSpeech(saved); }).catch(() => {});
     void invoke<ProviderStatus>('ai_provider_status').then((status) => {
       if (current) {
         setProviderStatus(status);
@@ -93,7 +96,7 @@ export function AssistantPanel({
           <p className="provider-note">Draft cleanup for the entire sequence: false starts, repeated words and takes, and quiet gaps. Preview and apply the cuts you choose.</p>
           <p className="provider-note">
             {ready && active && profile
-              ? <>Whisper runs locally. Your brief, transcript, and timing go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}. Transcript questions and Advanced analysis also send recent conversation.</>
+              ? <>{speech?.config.engine === 'openAi' ? 'Audio is sent to OpenAI for word-timed transcription.' : speech ? 'Whisper runs locally.' : 'Transcription follows your saved settings.'} Your brief, transcript, and timing go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}. Transcript questions and Advanced analysis also send recent conversation.</>
               : providerError || providerStatus?.warning || 'Set up an AI provider to use the timeline assistant.'}
             {' '}<button className="text-link" type="button" onClick={() => onSettings('providers')}>AI providers</button>
             {' · '}<button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription</button>

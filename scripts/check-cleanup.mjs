@@ -28,6 +28,7 @@ async function reloadReview(panel, count, checked) {
   await browser.send('Page.reload');
   await waitFor("!window.reloadingCleanupCheck && document.querySelector(" + JSON.stringify(panel) + ") && document.querySelectorAll('.cleanup-results li').length === " + count);
   assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), checked);
+  await waitFor("!!document.querySelector('.stage-label')");
   assert.equal(await evaluate("document.querySelector('.stage-label').textContent.includes('CLEANUP PREVIEW')"), false);
   assert.equal(await evaluate("cleanupCalls.includes('cleanup_begin')"), false);
 }
@@ -81,6 +82,12 @@ try {
               transcriptCacheIssue: null,
               retakeIssue: mode === "partial" ? "The AI provider timed out." : null,
               ...(stage === "draft" && { draftSummary: "Review the proposed edits." }),
+              ...(stage === "draft" && { planning: {
+                strategy: "fullTimeline", timelineKey: "mock-analyzed-timeline", totalUtterances: 159, reviewedUtterances: 159,
+                contextBudgetTokens: 32768, outputBudgetTokens: 10922, fallbackReason: null,
+                reviews: [{ scope: "fullTimeline", start: 0, end: 4, utterances: 159, completed: true, error: null, edits: 2,
+                  passes: [{ inputBytes: 18000, estimatedInputTokens: 7000, response: { cuts: [] }, validation: "Validated 2 edits." }] }]
+              } }),
               ...(stage === "draft" && mode === "quiet" && { canClearTimeline: true }),
               ...(stage === "chat" && { assistantTurn: [{ id: 1, role: "assistant", text: "Transcript answer" }] }),
               proposals: stage === "draft" && mode === "quiet" ? [{ ...pause, remove: { start: 0, end: 4 } }] : stage === "draft" ? (
@@ -198,6 +205,7 @@ try {
   await waitFor("document.querySelectorAll('.cleanup-results li').length === 2");
   assert.equal(await evaluate("assistantRequests[0].stage"), 'draft');
   assert.match(await evaluate("assistantRequests[0].message"), /Preserve unique details/);
+  assert.match(await evaluate("document.querySelector('.cleanup-planning-details').textContent"), /159 of 159/);
   assert.equal(await evaluate("document.querySelectorAll('.cleanup-results input:checked').length"), 0);
   await click('Select all pauses');
   await click('Select all retakes');
@@ -207,6 +215,8 @@ try {
   await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].cleanupDraft?.checked[0] === 1");
   await click('Preview selected');
   await reloadReview('.assistant-panel', 2, 1);
+  assert.equal((await savedDraft()).review.report.planning.timelineKey, 'mock-analyzed-timeline');
+  assert.match(await evaluate("document.querySelector('.cleanup-planning-details').textContent"), /Validated 2 edits/);
   assert.deepEqual(await savedTimeline(), before);
   await evaluate("cleanupMock.mode = 'unavailable'");
   await click('Draft cleanup');

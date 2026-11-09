@@ -16,6 +16,63 @@ use super::{
 };
 
 #[tokio::test]
+#[ignore = "requires CUTLINE_REVIEW_PROVIDER and CUTLINE_REVIEW_OUTPUT; sends a public synthetic 159-row transcript"]
+async fn synthetic_full_timeline() {
+    use super::{Range, TimelineUtterance};
+    let provider = PathBuf::from(std::env::var_os("CUTLINE_REVIEW_PROVIDER").unwrap());
+    let output = PathBuf::from(std::env::var_os("CUTLINE_REVIEW_OUTPUT").unwrap());
+    fs::create_dir_all(&output).unwrap();
+    let connection = Connection::configured_for_test(&provider).unwrap();
+    let mut texts: Vec<_> = (0..159).map(|index| format!(
+        "Measurement {} used batch size {} and completed {} requests in {} milliseconds. Record these exact values.",
+        index + 1, index + 16, index + 250, index * 37 + 101,
+    )).collect();
+    texts[0] = "Open the export settings and choose the MP4 codec.".into();
+    texts[158] =
+        "Open the export settings, choose the MP4 codec, and select 30 frames per second.".into();
+    let lines: Vec<_> = texts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, text)| TimelineUtterance {
+            run: 0,
+            ordinal,
+            last: ordinal == 158,
+            speech: Range::new(ordinal as f64 * 10.0 + 0.2, ordinal as f64 * 10.0 + 8.0),
+            cut_start: Some(ordinal as f64 * 10.0),
+            cut_end: Some(ordinal as f64 * 10.0 + 8.15),
+            text,
+            words: Vec::new(),
+        })
+        .collect();
+    let draft = assistant::draft::run(&connection,
+        "Remove clearly repeated takes, keeping the complete instruction with every unique setting. Preserve every numbered measurement and its exact values; those are distinct experimental results, not repeated takes. Preserve intentional repetition and unique information.",
+        &lines,&[],&CancellationToken::new()).await.unwrap();
+    let diagnostics = connection.diagnostics();
+    fs::write(output.join("full-timeline.json"),serde_json::to_vec_pretty(&json!({
+        "summary":draft.summary,"proposals":draft.proposals,"notes":draft.notes,"planning":diagnostics,
+    })).unwrap()).unwrap();
+    assert_eq!(diagnostics.strategy, "fullTimeline");
+    assert_eq!(diagnostics.reviewed_utterances, 159);
+    assert!(
+        draft.notes.is_empty(),
+        "Unresolved notes: {:?}",
+        draft.notes
+    );
+    assert_eq!(
+        draft.proposals.len(),
+        1,
+        "Only the abandoned export instruction should be removed."
+    );
+    assert_eq!(draft.proposals[0].kind, "retake");
+    assert!(draft.proposals[0].remove.end < 9.0);
+    assert_eq!(draft.proposals[0].keep, Some(lines[158].speech));
+    println!(
+        "PASS: all 159 utterances in one context; retained 157 unique measurements and the complete distant take; {} planning passes.",
+        diagnostics.reviews[0].passes.len()
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires CUTLINE_REVIEW_PROVIDER and CUTLINE_REVIEW_OUTPUT; sends only public synthetic transcript fixtures"]
 async fn synthetic_agent_cleanup() {
     use super::{Range, TimelineUtterance, audio::Word};
