@@ -69,22 +69,22 @@ try {
   await browser.send('Page.navigate', { url: process.env.CUTLINE_URL || 'http://127.0.0.1:1421/' });
   await waitFor("!!document.querySelector('.home-shell')");
   await click('Settings');
-  await waitFor("!!document.querySelector('.speech-settings select')");
-  assert.equal(await evaluate("document.querySelector('.speech-settings select').value"), 'autoBalanced');
-  await evaluate("const select = document.querySelector('.speech-settings select'); select.value = 'largeV3'; select.dispatchEvent(new Event('change', {bubbles:true}));");
+  await waitFor("!!document.querySelector('.speech-settings select[aria-label=\"Local transcription model\"]')");
+  assert.equal(await evaluate("document.querySelector('.speech-settings select[aria-label=\"Local transcription model\"]').value"), 'autoBalanced');
+  await evaluate("const select = document.querySelector('.speech-settings select[aria-label=\"Local transcription model\"]'); select.value = 'largeV3'; select.dispatchEvent(new Event('change', {bubbles:true}));");
   await click('Save and use');
   await waitFor("document.querySelector('.speech-summary strong').textContent === 'Whisper Large v3'");
   assert.equal(await evaluate('speechMock.config.preference'), 'largeV3');
   await click('Download and test');
   await waitFor("document.querySelector('.speech-settings').textContent.includes('transcription test completed')");
-  assert.equal(await evaluate("document.querySelector('.speech-settings select').value"), 'largeV3');
+  assert.equal(await evaluate("document.querySelector('.speech-settings select[aria-label=\"Local transcription model\"]').value"), 'largeV3');
   assert.equal(await evaluate("document.querySelector('.speech-summary strong').textContent"), 'Whisper Large v3');
   assert.equal(await evaluate("speechCalls.find(call => call.command === 'speech_prepare').args.retest"), true);
   assert.ok(await evaluate("document.querySelector('.speech-summary').textContent.includes('GPU testing failed')"));
   await click('AI providers');
   await waitFor("!!document.querySelector('input[type=password]')");
   await click('Transcription');
-  await waitFor("document.querySelector('.speech-settings select')?.value === 'largeV3'");
+  await waitFor("document.querySelector('.speech-settings select[aria-label=\"Local transcription model\"]')?.value === 'largeV3'");
   await evaluate("speechMode = 'cancel'");
   await click('Download and test');
   await waitFor("document.querySelector('.speech-settings').textContent.includes('Testing Whisper Large v3')");
@@ -93,11 +93,20 @@ try {
   await click('Refresh hardware');
   await waitFor("document.querySelector('.speech-settings').textContent.includes('Hardware checked')");
   assert.ok(await evaluate("speechCalls.some(call => call.command === 'speech_status' && call.args?.recheck === true)"));
+  await evaluate(`const engine = document.querySelector('select[aria-label="Transcription engine"]'); engine.value = 'openAi'; engine.dispatchEvent(new Event('change', {bubbles:true}));`);
+  await click('Save and use');
+  assert.equal(await evaluate('speechMock.config.engine'), 'openAi');
+  assert.equal(await evaluate("document.querySelector('.speech-summary')"), null);
+  assert.ok(await evaluate("document.querySelector('.speech-settings').textContent.includes('Audio is uploaded to OpenAI')"));
+  assert.ok(await evaluate("!Array.from(document.querySelectorAll('button')).some(b => b.textContent === 'Download and test')"));
+  await click('AI providers');
+  await click('Transcription');
+  await waitFor(`document.querySelector('select[aria-label="Transcription engine"]')?.value === 'openAi'`);
   if (process.env.SPEECH_SCREENSHOT) {
     const { data } = await browser.send('Page.captureScreenshot', { format: 'png' });
     await writeFile(process.env.SPEECH_SCREENSHOT, Buffer.from(data, 'base64'));
   }
-  console.log('Speech UI passed: fixed model, saved preference, CPU fallback display, benchmark, tabs, cancellation and hardware refresh.');
+  console.log('Speech UI passed: OpenAI selection and restoration, upload disclosure, fixed model, saved preference, CPU fallback display, benchmark, tabs, cancellation and hardware refresh.');
 } finally {
   if (scriptId) await browser.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId });
   browser.close();

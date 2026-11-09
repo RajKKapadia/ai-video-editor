@@ -54,8 +54,22 @@ pub(crate) enum Processing {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Config {
+    #[serde(default)]
+    pub(super) engine: TranscriptionEngine,
     preference: Preference,
     processing: Processing,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum TranscriptionEngine {
+    #[default]
+    Local,
+    OpenAi,
+}
+
+pub(super) fn engine(app: &AppHandle) -> Result<TranscriptionEngine, String> {
+    Ok(settings(app)?.config.engine)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -414,6 +428,9 @@ pub(crate) async fn speech_status(app: AppHandle, recheck: Option<bool>) -> Resu
 #[tauri::command]
 pub(crate) async fn speech_save(app: AppHandle, config: Config) -> Result<Status, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if config.engine == TranscriptionEngine::OpenAi {
+            super::providers::openai_audio_key()?;
+        }
         {
             let store = app.state::<Store>();
             let _lock = store.lock.lock().unwrap();
@@ -781,10 +798,18 @@ mod tests {
     fn preferences_persist_without_losing_benchmarks_and_reject_unknown_models() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("settings.json");
+        let legacy: Config =
+            serde_json::from_str(r#"{"preference":"largeV3","processing":"auto"}"#).unwrap();
+        assert_eq!(legacy.engine, TranscriptionEngine::Local);
         let mut settings = load(&path).unwrap();
+        settings.config.engine = TranscriptionEngine::OpenAi;
         settings.config.preference = Preference::LargeV3;
         save(&path, &settings).unwrap();
         assert_eq!(load(&path).unwrap().config.preference, Preference::LargeV3);
+        assert_eq!(
+            load(&path).unwrap().config.engine,
+            TranscriptionEngine::OpenAi
+        );
         assert!(
             serde_json::from_str::<Config>(r#"{"preference":"large-v4","processing":"auto"}"#)
                 .is_err()

@@ -302,7 +302,7 @@ fn sample(bytes: &[u8]) -> f32 {
     i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0
 }
 
-fn mono(bytes: &[u8]) -> Vec<f32> {
+pub(super) fn mono(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(FRAME_BYTES)
         .map(|frame| {
@@ -546,7 +546,7 @@ impl Detected {
             })
     }
 
-    fn utterance_groups(&self) -> Vec<Range> {
+    pub(super) fn utterance_groups(&self) -> Vec<Range> {
         let mut groups: Vec<Range> = Vec::new();
         for speech in &self.speech {
             if let Some(group) = groups.last_mut()
@@ -558,6 +558,59 @@ impl Detected {
             }
         }
         groups
+    }
+
+    /// Attach provider words to the same measured speech groups used by local
+    /// transcription and cache trimming. Missing groups retain ordinal gaps.
+    pub(super) fn api_utterances(&self, words: Vec<Word>) -> Result<Vec<Utterance>, String> {
+        let groups = self.utterance_groups();
+        let mut grouped = vec![Vec::new(); groups.len()];
+        for word in words {
+            let middle = (word.speech.start + word.speech.end) * 0.5;
+            let (index, distance) = groups
+                .iter()
+                .enumerate()
+                .map(|(index, group)| {
+                    (
+                        index,
+                        (group.start - middle).max(middle - group.end).max(0.0),
+                    )
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .ok_or("OpenAI returned words outside detected speech.")?;
+            if distance > 0.5 {
+                return Err("OpenAI word timing disagrees with the detected speech. This source needs review.".into());
+            }
+            grouped[index].push(word);
+        }
+        let mut utterances = Vec::new();
+        for (ordinal, words) in grouped.into_iter().enumerate() {
+            // Never treat untranscribed detected speech as reviewed material.
+            if words.is_empty() {
+                return Err(
+                    "OpenAI omitted a detected speech passage. This source was left for review."
+                        .into(),
+                );
+            }
+            let speech = Range::new(
+                groups[ordinal].start.min(words[0].speech.start),
+                groups[ordinal].end.max(words.last().unwrap().speech.end),
+            );
+            utterances.push(Utterance {
+                speech,
+                start: self.before(speech.start),
+                end: self.after(speech.end, self.duration),
+                ordinal,
+                last: ordinal + 1 == groups.len(),
+                text: words
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                words,
+            });
+        }
+        Ok(utterances)
     }
 }
 

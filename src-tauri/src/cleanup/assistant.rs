@@ -1,5 +1,6 @@
 mod chunks;
 pub(super) mod draft;
+pub(crate) mod planning;
 mod selections;
 
 use std::{collections::HashSet, path::Path};
@@ -378,6 +379,7 @@ pub(super) async fn review(
                     name: "timeline_assistant",
                     instructions: &instructions,
                     schema,
+                    output_tokens: 4096,
                 },
                 &session.control.cancel,
             )
@@ -529,6 +531,14 @@ fn removes_all_speech(proposals: &[Proposal], utterances: &[TimelineUtterance<'_
 
 fn conflicts(left: &Proposal, right: &Proposal) -> bool {
     left.remove.overlaps(right.remove)
+        // Adjacent removals form one edit. Separated removals must not strand
+        // an audible micro-fragment between joins; preserve it for review.
+        || {
+            let gap = if left.remove.end <= right.remove.start {
+                right.remove.start - left.remove.end
+            } else { left.remove.start - right.remove.end };
+            gap > 0.000_001 && gap < 0.15 - 0.000_001
+        }
         // Measured pause removals contain no speech. They can tighten the gaps
         // between utterances of a retained take without deleting that take.
         || (right.kind != "pause" && left.keep.is_some_and(|keep| keep.overlaps(right.remove)))

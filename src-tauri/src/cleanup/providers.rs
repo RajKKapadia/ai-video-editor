@@ -8,6 +8,8 @@ use tauri::{AppHandle, Manager};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 
+use super::assistant::planning::{Budget, DEFAULT_CONTEXT_TOKENS, Diagnostics};
+
 const SERVICE: &str = "com.logan.tauri-app.ai-providers";
 const MAX_REPLY_BYTES: usize = 256 * 1024;
 
@@ -31,11 +33,27 @@ impl Provider {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Config {
     model: String,
     base_url: Option<String>,
+    #[serde(default = "default_context_tokens")]
+    context_window_tokens: usize,
+}
+
+fn default_context_tokens() -> usize {
+    DEFAULT_CONTEXT_TOKENS
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            base_url: None,
+            context_window_tokens: DEFAULT_CONTEXT_TOKENS,
+        }
+    }
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -67,10 +85,14 @@ pub(crate) struct Connection {
     provider: Provider,
     config: Config,
     key: Option<HeaderValue>,
+    pub(super) planning: Mutex<Diagnostics>,
 }
 
 impl Config {
     fn validate(&mut self, provider: Provider) -> Result<(), String> {
+        if !(8192..=2_000_000).contains(&self.context_window_tokens) {
+            return Err("Enter a context budget between 8,192 and 2,000,000 tokens.".into());
+        }
         self.model = self.model.trim().to_owned();
         if self.model.is_empty()
             || self.model.len() > 200
@@ -134,6 +156,13 @@ impl Config {
 
 fn credential_error() -> String {
     "The system credential store is unavailable. Unlock it and try again.".into()
+}
+
+// Audio always goes to OpenAI's fixed endpoint, independently of the planner.
+pub(super) fn openai_audio_key() -> Result<HeaderValue, String> {
+    Config::default().key(Provider::OpenAi)?.ok_or_else(|| {
+        "Save an OpenAI API key in Settings → AI providers before using API transcription.".into()
+    })
 }
 
 fn secret_header(key: &str) -> Result<HeaderValue, String> {
@@ -316,6 +345,7 @@ pub(crate) async fn connection(
             provider,
             config,
             key,
+            planning: Mutex::default(),
         })
     })
     .await
@@ -381,6 +411,7 @@ fn retake_task() -> Task<'static> {
         name: "retakes",
         instructions: INSTRUCTIONS,
         schema,
+        output_tokens: 4096,
     }
 }
 
@@ -399,9 +430,20 @@ pub(super) struct Task<'a> {
     pub name: &'static str,
     pub instructions: &'a str,
     pub schema: Value,
+    pub output_tokens: usize,
 }
 
 impl Connection {
+    pub(super) fn budget(&self) -> Budget {
+        Budget::new(self.config.context_window_tokens)
+    }
+
+    pub(super) fn diagnostics(&self) -> Diagnostics {
+        let mut diagnostics = self.planning.lock().unwrap().clone();
+        diagnostics.provider = self.provider.account().into();
+        diagnostics.model = self.config.model.clone();
+        diagnostics
+    }
     #[cfg(test)]
     pub(in crate::cleanup) fn configured_for_test(path: &Path) -> Result<Self, String> {
         let settings = load(path)?;
@@ -433,6 +475,7 @@ impl Connection {
             provider,
             config,
             key,
+            planning: Mutex::default(),
         })
     }
 
@@ -442,13 +485,14 @@ impl Connection {
             name,
             instructions,
             schema,
+            output_tokens,
         } = task;
         let (url, body) = match self.provider {
             Provider::OpenAi => (
                 "https://api.openai.com/v1/responses".into(),
                 json!({
                     "model": model, "instructions": instructions, "input": input, "store": false,
-                    "max_output_tokens": 4096,
+                    "max_output_tokens": output_tokens, "truncation": "disabled",
                     "text": {"format": {"type": "json_schema", "name": name, "strict": true, "schema": schema}}
                 }),
             ),
@@ -456,7 +500,7 @@ impl Connection {
                 "https://api.anthropic.com/v1/messages".into(),
                 json!({
                     "model": model, "system": instructions, "messages": [{"role": "user", "content": input}],
-                    "max_tokens": 4096, "output_config": {"format": {"type": "json_schema", "schema": schema}}
+                    "max_tokens": output_tokens, "output_config": {"format": {"type": "json_schema", "schema": schema}}
                 }),
             ),
             Provider::Gemini => (
@@ -465,7 +509,7 @@ impl Connection {
                 ),
                 json!({
                     "systemInstruction": {"parts": [{"text": instructions}]}, "contents": [{"parts": [{"text": input}]}],
-                    "generationConfig": {"responseMimeType": "application/json", "responseJsonSchema": schema, "maxOutputTokens": 4096}
+                    "generationConfig": {"responseMimeType": "application/json", "responseJsonSchema": schema, "maxOutputTokens": output_tokens}
                 }),
             ),
             Provider::Compatible => (
@@ -475,7 +519,7 @@ impl Connection {
                 ),
                 json!({
                     "model": model, "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": input}],
-                    "max_tokens": 4096, "stream": false
+                    "max_tokens": output_tokens, "stream": false
                 }),
             ),
         };
@@ -578,6 +622,9 @@ impl Connection {
                     if [
                         "context_length",
                         "context window",
+                        "maximum context length",
+                        "maximum input length",
+                        "input is too long",
                         "too many tokens",
                         "input token count",
                         "prompt is too long",
@@ -618,10 +665,10 @@ impl Connection {
 }
 
 #[derive(Debug)]
-struct ProviderFailure {
-    message: String,
-    transient: bool,
-    retry_after: Option<Duration>,
+pub(super) struct ProviderFailure {
+    pub message: String,
+    pub transient: bool,
+    pub retry_after: Option<Duration>,
 }
 
 impl From<&str> for ProviderFailure {
@@ -644,7 +691,7 @@ impl From<String> for ProviderFailure {
     }
 }
 
-fn retryable_status(status: u16, body: &[u8]) -> bool {
+pub(super) fn retryable_status(status: u16, body: &[u8]) -> bool {
     if matches!(status, 408 | 409 | 500..=599) {
         return true;
     }
@@ -657,7 +704,10 @@ fn retryable_status(status: u16, body: &[u8]) -> bool {
         || (code.is_empty() && value["error"]["type"] == "rate_limit_error")
 }
 
-async fn retry<F, Fut>(mut operation: F, cancel: &CancellationToken) -> Result<String, String>
+pub(super) async fn retry<F, Fut>(
+    mut operation: F,
+    cancel: &CancellationToken,
+) -> Result<String, String>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<String, ProviderFailure>>,
@@ -693,6 +743,16 @@ where
 }
 
 fn reply_text(provider: Provider, value: &Value) -> Result<&str, String> {
+    if (provider == Provider::OpenAi
+        && value["incomplete_details"]["reason"] == "max_output_tokens")
+        || (provider == Provider::Anthropic && value["stop_reason"] == "max_tokens")
+        || (provider == Provider::Gemini && value["candidates"][0]["finishReason"] == "MAX_TOKENS")
+        || (provider == Provider::Compatible && value["choices"][0]["finish_reason"] == "length")
+    {
+        return Err(
+            "The AI provider reached its output limit before completing the cut list.".into(),
+        );
+    }
     match provider {
         Provider::OpenAi if value["status"] == "completed" => value["output"]
             .as_array()
@@ -743,6 +803,49 @@ fn parse_retakes(text: &str) -> Result<Vec<Retake>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_profiles_get_an_explicit_budget_and_invalid_budgets_are_rejected() {
+        let config: Config =
+            serde_json::from_value(json!({"model":"saved-model","baseUrl":null})).unwrap();
+        assert_eq!(config.context_window_tokens, DEFAULT_CONTEXT_TOKENS);
+        let mut invalid = Config {
+            model: "saved-model".into(),
+            context_window_tokens: 0,
+            ..Config::default()
+        };
+        assert!(invalid.validate(Provider::OpenAi).is_err());
+        invalid.context_window_tokens = 128_000;
+        invalid.validate(Provider::OpenAi).unwrap();
+        let restored: Config =
+            serde_json::from_value(serde_json::to_value(&invalid).unwrap()).unwrap();
+        assert_eq!(restored.context_window_tokens, 128_000);
+    }
+
+    #[test]
+    fn distinguishes_exhausted_output_budgets_from_refused_or_malformed_replies() {
+        for (provider, value) in [
+            (
+                Provider::OpenAi,
+                json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
+            ),
+            (Provider::Anthropic, json!({"stop_reason":"max_tokens"})),
+            (
+                Provider::Gemini,
+                json!({"candidates":[{"finishReason":"MAX_TOKENS"}]}),
+            ),
+            (
+                Provider::Compatible,
+                json!({"choices":[{"finish_reason":"length"}]}),
+            ),
+        ] {
+            assert!(
+                reply_text(provider, &value)
+                    .unwrap_err()
+                    .contains("output limit")
+            );
+        }
+    }
 
     #[test]
     fn retries_temporary_failures_but_not_authentication_or_billing_limits() {
@@ -894,8 +997,10 @@ mod tests {
                     model: "test-model".into(),
                     base_url: (provider == Provider::Compatible)
                         .then(|| "https://example.test/v1".into()),
+                    ..Config::default()
                 },
                 key: Some(secret_header("synthetic-secret").unwrap()),
+                planning: Mutex::default(),
             };
             let request = connection
                 .request(&client, transcript, retake_task())
@@ -960,8 +1065,10 @@ mod tests {
             config: Config {
                 model: "test".into(),
                 base_url: Some("http://127.0.0.1:1/v1".into()),
+                ..Config::default()
             },
             key: None,
+            planning: Mutex::default(),
         };
         let cancel = CancellationToken::new();
         assert!(

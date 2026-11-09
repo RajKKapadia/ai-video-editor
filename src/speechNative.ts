@@ -7,6 +7,7 @@ export const whisperModels = {
 
 export type WhisperModel = keyof typeof whisperModels;
 export type SpeechConfig = {
+  engine: 'local' | 'openAi';
   preference: 'autoBalanced' | 'autoAccuracy' | WhisperModel;
   processing: 'auto' | 'cpu';
 };
