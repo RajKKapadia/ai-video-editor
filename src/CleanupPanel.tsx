@@ -77,9 +77,9 @@ export function CleanupPanel({
         ) : (
           <>
             <div className="assistant-controls">
-              <p className="provider-note">Adaptive cleanup connects partial attempts, removes accidental repeats, and checks the assembled audio. Review the draft before applying.</p>
+              <p className="provider-note">Adaptive cleanup connects partial attempts and removes accidental repeats. Local Whisper mode checks the assembled audio.</p>
               <p className="provider-note">{active && profile?.ready
-                ? <>Your transcript and timing go to {providers[active]} · {profile.model}. Audio checks run locally.</>
+                ? <>{speech?.config.engine === 'openAi' && 'Audio is sent to OpenAI for word-timed transcription. '}Your transcript and timing go to {providers[active]} · {profile.model}.</>
                 : 'Set up an AI provider to draft adaptive cleanup.'}
                 {' '}<button className="text-link" type="button" onClick={() => onSettings('providers')}>AI providers</button>
               </p>
@@ -91,7 +91,7 @@ export function CleanupPanel({
               <legend>Basic analysis</legend>
               <label><input type="checkbox" checked={pauses} onChange={(event) => setPauses(event.target.checked)} /> Shorten pauses</label>
               <label><input type="checkbox" checked={retakes} onChange={(event) => setRetakes(event.target.checked)} /> Remove repeated takes</label>
-              {retakes && speech && <p className="provider-note">{whisperModels[speech.selection.model]} · {speech.selection.device?.name ?? 'CPU'} · <button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription settings</button></p>}
+              {retakes && speech && <p className="provider-note">{speech.config.engine === 'openAi' ? 'OpenAI API · whisper-1' : `${whisperModels[speech.selection.model]} · ${speech.selection.device?.name ?? 'CPU'}`} · <button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription settings</button></p>}
               {retakes ? (
                 <p className="provider-note">
                   {active && profile?.ready
@@ -103,7 +103,7 @@ export function CleanupPanel({
                 <p className="provider-note">Speech analysis runs on this device. First use downloads the required speech models.</p>
               )}
               {retakes && active && profile?.ready && (
-                <p className="provider-note">First use downloads the local speech models. Comparing takes may use your provider quota.</p>
+                <p className="provider-note">{speech?.config.engine === 'openAi' ? 'Audio is sent to OpenAI using your saved key. Transcription and take review use your provider quota.' : 'First use downloads the local speech models. Comparing takes may use your provider quota.'}</p>
               )}
               {!hasAudio && <p className="provider-note">Add footage with audio to your timeline to start.</p>}
               <button className="button secondary" disabled={!hasAudio || (!pauses && !retakes) || (retakes && !profile?.ready)} onClick={() => {
@@ -141,8 +141,19 @@ export function CutReview({
         {report.proposals.some((proposal) => proposal.kind === 'pause') && 'Quiet cuts use measured audio gaps. '}
         Preview your selection to check the flow.
       </p>}
+      {report.planning && <details className="cleanup-planning-details">
+        <summary>Planning details · {report.planning.reviewedUtterances} of {report.planning.totalUtterances} transcript entries reviewed</summary>
+        <p className="provider-note">{report.planning.strategy === 'fullTimeline' ? 'Reviewed the complete transcript together.' : 'Reviewed overlapping sections and compared likely distant repeats.'} These diagnostics refer to the timeline when analysis started.</p>
+        {report.planning.fallbackReason && <p className="provider-note">{report.planning.fallbackReason}</p>}
+        <ol>{report.planning.reviews.map((entry, index) => <li key={index}>
+          {entry.scope === 'fullTimeline' ? 'Complete transcript' : entry.scope === 'comparison' ? 'Distant take comparison' : 'Transcript section'}: {entry.completed ? `${entry.edits} suggestions` : 'Incomplete'} · {entry.passes.length} planning passes
+          {entry.error && <p className="cleanup-warning">{entry.error}</p>}
+          <ul>{entry.passes.map((pass, passIndex) => <li key={passIndex}>{pass.validation}</li>)}</ul>
+        </li>)}</ol>
+      </details>}
       {report.reviewNotes?.map((note, index) => <p className="cleanup-warning" role="status" key={index}>{note}</p>)}
       {report.canClearTimeline && <p className="provider-note">All analyzed audio is quiet. Applying every removal will clear the timeline. Undo restores it.</p>}
+      {report.processingDevice === 'OpenAI API' && <p className="provider-note">Transcribed with OpenAI API · whisper-1</p>}
       {report.speech && <p className="provider-note">Transcribed with {whisperModels[report.speech.model]} · {report.speech.device?.name ?? 'CPU'}</p>}
       {!!report.failedSources && (
         <p className="cleanup-warning" role="status">

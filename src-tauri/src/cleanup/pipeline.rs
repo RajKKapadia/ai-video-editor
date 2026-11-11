@@ -16,7 +16,7 @@ use super::{
     LOCAL_TRANSCRIPT_TOO_LARGE as TRANSCRIPT_TOO_LARGE, MediaInput, Session,
     audio::{Engine, PreparedAudio},
     cache::{Cache, Transcript, linked_key},
-    progress, speech,
+    progress, speech, transcript_store, transcription_api,
     worker::Transcriber,
 };
 
@@ -39,10 +39,11 @@ impl Pipeline {
         vad: PathBuf,
         whisper: Option<PathBuf>,
         selection: Option<speech::Selection>,
+        remote: Option<transcription_api::Transcriber>,
     ) -> Self {
         let (sources, incoming) = mpsc::channel(1);
         let task = tauri::async_runtime::spawn_blocking(move || {
-            let transcribing = AtomicBool::new(whisper.is_some());
+            let transcribing = AtomicBool::new(whisper.is_some() || remote.is_some());
             let progress = PipelineProgress::new(&app, &session);
             let cache = Mutex::new(
                 session
@@ -53,7 +54,8 @@ impl Pipeline {
             );
             let model = selection
                 .as_ref()
-                .map(|selection| selection.model.file().checksum);
+                .map(|selection| selection.model.file().checksum)
+                .or(remote.as_ref().map(|_| transcription_api::CACHE_MODEL));
             let mut transcriber =
                 whisper
                     .as_deref()
@@ -83,11 +85,11 @@ impl Pipeline {
                 let result = collect(
                     prepared,
                     &mut transcriber,
+                    remote.as_ref(),
                     selection.as_ref(),
                     &progress,
                     &transcribing,
                     &cache,
-                    model,
                 );
                 let decoded = decoder
                     .join()
@@ -116,8 +118,8 @@ impl Pipeline {
 
 enum PreparedRange {
     Decoded(Option<PreparedAudio>, Option<Arc<MediaRevision>>),
-    Cached(Analysis, Option<String>),
-    Repeated(usize),
+    Cached(Analysis, Option<String>, Arc<MediaRevision>),
+    Repeated(usize, Option<Arc<MediaRevision>>),
 }
 
 struct MediaRevision {
@@ -168,7 +170,9 @@ fn decode(
             let range = session.runs[index].source;
             let key = (range.start.to_bits(), range.end.to_bits());
             let audio = match seen.entry(key) {
-                Entry::Occupied(previous) => PreparedRange::Repeated(*previous.get()),
+                Entry::Occupied(previous) => {
+                    PreparedRange::Repeated(*previous.get(), revision.clone())
+                }
                 Entry::Vacant(first) => {
                     first.insert(index);
                     let cached = revision.as_ref().and_then(|media| {
@@ -178,7 +182,7 @@ fn decode(
                             .find(&media.key, range, model, session.pauses)
                     });
                     if let Some((analysis, device)) = cached {
-                        PreparedRange::Cached(analysis, device)
+                        PreparedRange::Cached(analysis, device, revision.as_ref().unwrap().clone())
                     } else {
                         let audio = engine
                             .prepare(
@@ -205,15 +209,17 @@ fn decode(
         }
         // Keep authorized source handles alive for local audition, including legacy
         // upload scratch files. They are released with the job on finish/cancel.
-        if session
-            .assistant
-            .as_ref()
-            .is_some_and(|(stage, _)| *stage == super::assistant::Stage::Draft)
+        let mut data = session.data.lock().unwrap();
+        if data.verification_models.is_some()
+            && session
+                .assistant
+                .as_ref()
+                .is_some_and(|(stage, _)| *stage == super::assistant::Stage::Draft)
         {
             let linked_revision = revision
                 .as_ref()
                 .and_then(|revision| revision.linked.as_ref().map(|_| revision.key.clone()));
-            session.data.lock().unwrap().verification_sources.insert(
+            data.verification_sources.insert(
                 clip_id,
                 super::verification::Source {
                     input: Arc::new(input),
@@ -222,7 +228,7 @@ fn decode(
             );
         }
         if let Some(released) = released {
-            session.data.lock().unwrap().staged = false;
+            data.staged = false;
             let _ = released.send(());
         }
     }
@@ -232,12 +238,15 @@ fn decode(
 fn collect(
     prepared: Receiver<(usize, PreparedRange)>,
     transcriber: &mut Option<Transcriber<'_>>,
+    remote: Option<&transcription_api::Transcriber>,
     selection: Option<&speech::Selection>,
     progress: &PipelineProgress<'_>,
     transcribing: &AtomicBool,
     cache: &Mutex<Cache>,
-    model: Option<&str>,
 ) -> Result<(), String> {
+    let model = selection
+        .map(|selection| selection.model.file().checksum)
+        .or(remote.map(|_| transcription_api::CACHE_MODEL));
     let session = progress.session;
     let mut results: Vec<Option<Arc<Analysis>>> = vec![None; session.runs.len()];
     let mut failed = HashSet::new();
@@ -245,16 +254,26 @@ fn collect(
     let mut issue = None;
     let mut notice = None;
     let mut devices = HashSet::new();
-    let mut device = selection
-        .and_then(|selection| selection.device.as_ref())
-        .map_or("CPU", |device| device.name.as_str());
+    let mut device = if remote.is_some() {
+        "OpenAI API"
+    } else {
+        selection
+            .and_then(|selection| selection.device.as_ref())
+            .map_or("CPU", |device| device.name.as_str())
+    };
     for (index, audio) in prepared {
         session.control.check()?;
         let run = &session.runs[index];
         let cached = matches!(audio, PreparedRange::Cached(..));
+        let revision = match &audio {
+            PreparedRange::Cached(_, _, revision) => Some(revision.clone()),
+            PreparedRange::Decoded(_, revision) | PreparedRange::Repeated(_, revision) => {
+                revision.clone()
+            }
+        };
         let result = match audio {
-            PreparedRange::Repeated(first) => results[first].clone(),
-            PreparedRange::Cached(analysis, device) => {
+            PreparedRange::Repeated(first, _) => results[first].clone(),
+            PreparedRange::Cached(analysis, device, _) => {
                 devices.extend(device);
                 Some(Arc::new(analysis))
             }
@@ -268,14 +287,32 @@ fn collect(
                 if session.pauses {
                     result.pauses = audio.detected.pauses();
                 }
-                if let (Some(worker), Some(pcm), Some(model)) =
-                    (transcriber.as_mut(), audio.pcm, model)
+                if let (Some(pcm), Some(model)) = (audio.pcm, model)
+                    && transcribing.load(Ordering::Relaxed)
                 {
-                    match worker.transcribe(
-                        pcm.path(),
-                        audio.detected.clone(),
-                        run.source.duration(),
-                    ) {
+                    let outcome = if let Some(remote) = remote {
+                        remote
+                            .transcribe(
+                                pcm.path(),
+                                &audio.detected,
+                                run.source.duration(),
+                                &session.control,
+                                |part, total| {
+                                    progress.update_stage(
+                                        &format!(
+                                            "Transcribing with OpenAI · part {part} of {total}"
+                                        ),
+                                        |_| {},
+                                    )
+                                },
+                            )
+                            .map(|lines| (lines, false))
+                    } else if let Some(worker) = transcriber.as_mut() {
+                        worker.transcribe(pcm.path(), audio.detected.clone(), run.source.duration())
+                    } else {
+                        Err("The transcription engine is unavailable.".into())
+                    };
+                    match outcome {
                         Ok((utterances, fallback)) => {
                             result.utterances = utterances;
                             if fallback {
@@ -317,6 +354,35 @@ fn collect(
                 Some(Arc::new(result))
             }
         };
+        if let (Some(result), Some(revision), Some(model)) = (&result, revision, model)
+            && !result.utterances.is_empty()
+            && revision
+                .linked
+                .as_ref()
+                .is_none_or(|path| linked_key(path).as_deref() == Some(revision.key.as_str()))
+            && let Some(project_id) = session.project_id.as_deref()
+        {
+            let saved =
+                crate::project_cache::with_project_cache(progress.app, project_id, |workspace| {
+                    transcript_store::save(
+                        &workspace.join(format!("transcripts-{project_id}.sqlite3")),
+                        &transcript_store::Source {
+                            media_key: &revision.key,
+                            clip_id: &run.clip_id,
+                            model,
+                            range: run.source,
+                            timeline_key: &session.timeline_key,
+                            snapshot_id: &session.id,
+                            run: index,
+                            timeline_start: run.timeline_start,
+                        },
+                        result,
+                    )
+                });
+            if let Err(error) = saved {
+                session.data.lock().unwrap().analysis_cache_issue = Some(error);
+            }
+        }
         if let Some(result) = &result {
             text_bytes += result
                 .utterances

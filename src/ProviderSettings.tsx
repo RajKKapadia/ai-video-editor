@@ -7,18 +7,21 @@ export function ProviderSettings() {
   const [provider, setProvider] = useState<Provider>('openAi');
   const [model, setModel] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
+  const [contextTokens, setContextTokens] = useState(32768);
   const [key, setKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const profile = status?.profiles[provider];
   const changed = model.trim() !== profile?.model ||
-    (provider === 'compatible' && baseUrl.trim() !== profile?.baseUrl) || !!key.trim();
+    (provider === 'compatible' && baseUrl.trim() !== profile?.baseUrl) ||
+    contextTokens !== (profile?.contextWindowTokens ?? 32768) || !!key.trim();
 
   function select(next: Provider, saved: ProviderStatus) {
     setProvider(next);
     setModel(saved.profiles[next]?.model ?? '');
     setBaseUrl(saved.profiles[next]?.baseUrl ?? '');
+    setContextTokens(saved.profiles[next]?.contextWindowTokens ?? 32768);
     setKey('');
     setError('');
     setNotice('');
@@ -57,7 +60,7 @@ export function ProviderSettings() {
         void run(async () => {
           const saved = await invoke<ProviderStatus>('ai_provider_save', {
             provider,
-            config: { model, baseUrl: provider === 'compatible' ? baseUrl : null },
+            config: { model, baseUrl: provider === 'compatible' ? baseUrl : null, contextWindowTokens: contextTokens },
             key: key.trim() || null,
           });
           setStatus(saved);
@@ -67,7 +70,7 @@ export function ProviderSettings() {
       }}
     >
       <p className="modal-intro">
-        Cutline sends transcript text to the active provider when you analyze retakes.
+        Cutline sends transcript text to the active provider when you analyze retakes. OpenAI transcription also uses the saved OpenAI key when selected in Transcription settings.
         Your API key is stored in your system credential store.
       </p>
       <fieldset className="provider-fields" disabled={!status || busy}>
@@ -95,6 +98,12 @@ export function ProviderSettings() {
           Model ID
           <input value={model} onChange={(event) => setModel(event.target.value)} required maxLength={200} spellCheck={false} />
         </label>
+        <label className="field">
+          Planning context budget (tokens)
+          <input type="number" min={8192} max={2000000} step={1} value={contextTokens}
+            onChange={(event) => setContextTokens(Number(event.target.value))} required />
+        </label>
+        <p className="provider-note">Use a budget within your model’s documented context window. Cutline estimates the full request size, reserves room for the response, and splits only when needed. This value is not detected automatically.</p>
         <label className="field">
           API key
           <input

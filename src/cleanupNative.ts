@@ -12,7 +12,7 @@ export const providers = {
 } as const;
 
 export type Provider = keyof typeof providers;
-export type ProviderConfig = { model: string; baseUrl: string | null };
+export type ProviderConfig = { model: string; baseUrl: string | null; contextWindowTokens?: number };
 export type ProviderProfile = ProviderConfig & { hasKey: boolean; ready: boolean };
 export type ProviderStatus = {
   active: Provider | null;

@@ -20,6 +20,22 @@ const saved: SavedCleanupDraft = { version: 1, review, checked: [1], pendingCuts
 const roundtrip = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
 
 describe('saved cleanup drafts', () => {
+  test('reopens planning passes and rejection reasons with their original timeline identity', () => {
+    const diagnosticReview: CleanupReview = { ...review, report: { ...review.report, planning: {
+      strategy: 'fullTimeline', timelineKey: 'analyzed-timeline-hash', totalUtterances: 159, reviewedUtterances: 159,
+      contextBudgetTokens: 32768, outputBudgetTokens: 10922, fallbackReason: null,
+      reviews: [{ scope: 'fullTimeline', start: 0, end: 20, utterances: 159, completed: true, error: null, edits: 2,
+        passes: [{ inputBytes: 18000, estimatedInputTokens: 7000, response: { cuts: [] }, validation: 'Validated 2 edits.' }] }],
+    } } };
+    const restored = restoreCleanupDraft(roundtrip({ ...saved, review: diagnosticReview }), roundtrip(timeline))!;
+    expect(restored.review?.report.planning).toEqual(diagnosticReview.report.planning);
+    const edit = makeCleanupEdit(timeline, [diagnosticReview.report.proposals[0].remove])!;
+    expect(remainingCleanupReview(diagnosticReview, new Set([0]), edit)?.report.planning?.timelineKey).toBe('analyzed-timeline-hash');
+    for (const planning of [null, {}, { ...diagnosticReview.report.planning, reviews: [null] },
+      { ...diagnosticReview.report.planning, reviewedUtterances: 160 },
+      { ...diagnosticReview.report.planning, reviews: [{ passes: 'invalid' }] },
+    ]) expect(restoreCleanupDraft(roundtrip({ ...saved, review: { ...review, report: { ...review.report, planning } } }), timeline)).toBeNull();
+  });
   test('restores reports and checkbox choices from JSON, binding to the reopened timeline', () => {
     const reopened = roundtrip(timeline);
     const restored = restoreCleanupDraft(roundtrip(saved), reopened)!;

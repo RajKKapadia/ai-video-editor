@@ -30,7 +30,7 @@ The detector offers measured quiet intervals of at least half a second outside d
 
 ## Source-backed local audition
 
-`cleanup/verification.rs` checks adaptive speech edits against the source media. Quiet cuts use the measured audio boundaries and are checked against speech ranges before review.
+`cleanup/verification.rs` checks adaptive speech edits against the source media in local Whisper mode. OpenAI transcription mode uses provider word timings and the same draft validation, with playback available for review. Quiet cuts use measured audio boundaries and are checked against speech ranges.
 
 1. Keep source handles alive until the job ends, including uploaded legacy scratch files. Linked-source revision checks detect changes between analysis and audition, including before using memoized results.
 2. Build a source-order context around each proposed removal. Compute the words expected to survive. Partial selections require complete, monotonic word alignment and may not cross a retained word.
@@ -68,7 +68,7 @@ Validation on 2026-11-11 used an isolated desktop build, Whisper Small on CPU, a
 This is an adaptive cutting implementation, not a guarantee of correct editing on every recording.
 
 - Recognition consistency uses the configured Whisper model again. It is not an independent speech recognizer, phoneme judge, or human listener. A clipped sound can remain recognizable, and both passes can share an error. Conversely, a harmless transcription variation can conservatively reject a good edit.
-- The provider sees text and timing, not audio/video. Quiet demonstrations and deliberate delivery rely on transcript context, the brief, and user review. There is no automatic visual inspection or learned perceptual rhythm scorer yet.
+- The planning provider sees text and timing. OpenAI transcription uploads audio to OpenAI. Quiet demonstrations and deliberate delivery rely on transcript context, the brief, and user review. There is no automatic visual inspection or learned perceptual rhythm scorer yet.
 - The measured splice alternatives use exact normalized word overlaps within nearby fragments. Reworded and more distant relationships depend on the semantic planner and its range-selection tools. Missing-ordinal and boundary checks protect untranscribed regions when they can be identified. Whisper can still omit or hallucinate speech.
 - The existing pause detector's quiet threshold, minimum duration, and padding are still candidate-generation limits. The provider decides whether those candidates are unwanted; this implementation does not learn arbitrary silence boundaries from a speaker's style.
 - Speech edits are checked individually and in combination. Preview the selected combination before applying.

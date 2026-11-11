@@ -1,6 +1,7 @@
 mod chunks;
 pub(super) mod draft;
 mod joins;
+pub(crate) mod planning;
 mod selections;
 
 use std::{collections::HashSet, path::Path};
@@ -379,6 +380,7 @@ pub(super) async fn review(
                     name: "timeline_assistant",
                     instructions: &instructions,
                     schema,
+                    output_tokens: 4096,
                 },
                 &session.control.cancel,
             )
@@ -529,17 +531,21 @@ fn removes_all_speech(proposals: &[Proposal], utterances: &[TimelineUtterance<'_
 }
 
 pub(super) fn conflicts(left: &Proposal, right: &Proposal) -> bool {
-    match (left.kind == "pause", right.kind == "pause") {
-        (true, true) => left.remove.overlaps(right.remove),
-        // A measured pause can overlap the padding of a speech cut or fall inside
-        // either take. It stays independently usable if the speech cut is rejected.
-        (true, false) | (false, true) => false,
-        (false, false) => {
-            left.remove.overlaps(right.remove)
-                || left.keep.is_some_and(|keep| keep.overlaps(right.remove))
-                || right.keep.is_some_and(|keep| keep.overlaps(left.remove))
+    // A measured pause can overlap the padding of a speech cut and remain
+    // independently usable if the speech cut is rejected.
+    (left.kind == "pause") == (right.kind == "pause") && left.remove.overlaps(right.remove)
+        // Adjacent removals form one edit. Separated removals must not strand
+        // an audible micro-fragment between joins; preserve it for review.
+        || {
+            let gap = if left.remove.end <= right.remove.start {
+                right.remove.start - left.remove.end
+            } else { left.remove.start - right.remove.end };
+            gap > 0.000_001 && gap < 0.15 - 0.000_001
         }
-    }
+        // Measured pause removals contain no speech. They can tighten the gaps
+        // between utterances of a retained take without deleting that take.
+        || (right.kind != "pause" && left.keep.is_some_and(|keep| keep.overlaps(right.remove)))
+        || (left.kind != "pause" && right.keep.is_some_and(|keep| keep.overlaps(left.remove)))
 }
 
 #[cfg(test)]

@@ -161,6 +161,19 @@ mod tests {
     }
 
     #[test]
+    fn zero_duration_words_remain_readable_but_cannot_anchor_internal_cuts() {
+        let mut sample = line();
+        sample.words[2].speech.end = sample.words[2].speech.start;
+        let selection = select(
+            UtteranceRange { first: 1, last: 1 },
+            Some(WordRange { first: 3, last: 4 }),
+            &[sample],
+        )
+        .unwrap();
+        assert!(selection.removal.is_none());
+    }
+
+    #[test]
     fn removes_a_repeated_phrase_and_keeps_the_complete_take_inside_one_utterance() {
         let lines = [line()];
         let ids = UtteranceRange { first: 1, last: 1 };

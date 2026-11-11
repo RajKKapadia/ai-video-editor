@@ -7,6 +7,8 @@ pub(crate) mod providers;
 #[cfg(test)]
 mod reliability;
 pub(crate) mod speech;
+mod transcript_store;
+mod transcription_api;
 mod verification;
 pub(crate) mod worker;
 
@@ -342,7 +344,18 @@ async fn setup(
     })
     .await?;
     let mut speech_selection = None;
-    let whisper = if connection.is_some() {
+    let mut remote = None;
+    if connection.is_some() && speech::engine(app)? == speech::TranscriptionEngine::OpenAi {
+        match transcription_api::Transcriber::new() {
+            Ok(transcriber) => remote = Some(transcriber),
+            Err(error) if allow_pause_only => {
+                retake_issue = Some(error);
+                connection = None;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let whisper = if connection.is_some() && remote.is_none() {
         progress(app, &session.id, "Preparing local transcription", None);
         match speech::prepare(app, &session.control, |stage, fraction| {
             progress(app, &session.id, stage, fraction)
@@ -372,6 +385,7 @@ async fn setup(
         vad,
         whisper,
         speech_selection.clone(),
+        remote,
     ));
     data.speech = speech_selection;
     data.connection = connection;
@@ -571,6 +585,7 @@ pub(crate) struct Proposal {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Report {
+    processing_device: Option<String>,
     proposals: Vec<Proposal>,
     retake_issue: Option<String>,
     transcript_cache_issue: Option<String>,
@@ -585,6 +600,8 @@ pub(crate) struct Report {
     can_clear_timeline: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification: Option<verification::Summary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planning: Option<assistant::planning::Diagnostics>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -641,16 +658,76 @@ pub(crate) async fn cleanup_finish(app: AppHandle, id: String) -> Result<Report,
             data.failed.len(),
         )
     };
-    let result = proposals(&app, &session, results, connection, issue, failed).await;
+    let mut result = proposals(&app, &session, results, connection.as_ref(), issue, failed).await;
+    let mut diagnostics = connection.as_ref().map(Connection::diagnostics);
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        diagnostics.timeline_key = session.timeline_key.clone();
+    }
+    if let Ok(report) = &mut result {
+        report.planning = diagnostics
+            .as_ref()
+            .filter(|diagnostics| !diagnostics.reviews.is_empty())
+            .cloned();
+    }
+    if let Some(project_id) = &session.project_id
+        && !matches!(
+            session.assistant.as_ref(),
+            Some((assistant::Stage::Chat, _))
+        )
+    {
+        // Keep source coordinates even after Apply changes timeline timestamps.
+        // Also persist failed reviews so an outage cannot erase the audit trail.
+        let audit = serde_json::json!({
+            "version": 1, "projectId": project_id, "jobId": session.id,
+            "timelineKey": session.timeline_key, "runs": session.runs,
+            "report": result.as_ref().ok(), "error": result.as_ref().err(),
+            "planning": diagnostics,
+        });
+        let saved = crate::project_cache::with_project_cache(&app, project_id, |workspace| {
+            save_cleanup_audit(workspace, project_id, &session.id, &audit)
+        });
+        if saved.is_err()
+            && let Ok(report) = &mut result
+        {
+            report
+                .review_notes
+                .push("Could not save the cleanup planning audit in the project workspace.".into());
+        }
+    }
     jobs.take(Some(&id));
     result
+}
+
+fn save_cleanup_audit(
+    workspace: &std::path::Path,
+    project_id: &str,
+    job_id: &str,
+    audit: &serde_json::Value,
+) -> Result<(), String> {
+    let history = workspace.join("cleanup-reviews");
+    match std::fs::create_dir(&history) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.to_string()),
+    }
+    let project_hash = format!("{:x}", Sha256::digest(project_id.as_bytes()));
+    let archived = format!(
+        "{project_hash}-{:x}.json",
+        Sha256::digest(job_id.as_bytes())
+    );
+    crate::project_cache::write_json(&history.join(archived), audit, false)?;
+    crate::project_cache::write_json(
+        &workspace.join(format!("cleanup-review-{project_hash}.json")),
+        audit,
+        true,
+    )
 }
 
 async fn proposals(
     app: &AppHandle,
     session: &Arc<Session>,
     results: Vec<Option<Arc<Analysis>>>,
-    connection: Option<Connection>,
+    connection: Option<&Connection>,
     retake_issue: Option<String>,
     failed_sources: usize,
 ) -> Result<Report, String> {
@@ -664,6 +741,7 @@ async fn proposals(
         )
     };
     let mut report = Report {
+        processing_device: processing_device.clone(),
         proposals: Vec::new(),
         retake_issue,
         transcript_cache_issue: cache_issue,
@@ -675,6 +753,7 @@ async fn proposals(
         review_notes: Vec::new(),
         can_clear_timeline: false,
         verification: None,
+        planning: None,
     };
     let drafting = session
         .assistant
@@ -722,14 +801,27 @@ async fn proposals(
     session.control.check()?;
     let utterances = ordered_utterances(&session.runs, &results);
     let mut transcript = None;
-    if !utterances.is_empty() || (session.assistant.is_some() && report.speech.is_some()) {
+    if !utterances.is_empty()
+        || (session.assistant.is_some()
+            && (report.speech.is_some() || processing_device.as_deref() == Some("OpenAI API")))
+    {
         let fresh = CachedTranscript {
             model: report
                 .speech
                 .as_ref()
                 .map(|selection| selection.model.file().name.to_owned())
-                .unwrap_or_else(|| "unknown".into()),
-            engine: whisper_rs::WHISPER_CPP_VERSION.into(),
+                .unwrap_or_else(|| {
+                    if processing_device.as_deref() == Some("OpenAI API") {
+                        transcription_api::MODEL.into()
+                    } else {
+                        "unknown".into()
+                    }
+                }),
+            engine: if processing_device.as_deref() == Some("OpenAI API") {
+                "openai".into()
+            } else {
+                whisper_rs::WHISPER_CPP_VERSION.into()
+            },
             processing_device: processing_device.unwrap_or_else(|| "CPU".into()),
             generated_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -771,7 +863,7 @@ async fn proposals(
         progress(app, &session.id, stage.progress(), None);
         if drafting {
             let draft = assistant::draft::run(
-                &connection,
+                connection,
                 message,
                 &utterances,
                 &gaps,
@@ -787,17 +879,25 @@ async fn proposals(
                     return Ok(report);
                 }
             };
-            let (draft, verification) = verification::finish(
-                app,
-                session,
-                &connection,
-                message,
-                &utterances,
-                &gaps,
-                draft,
-            )
-            .await?;
-            report.verification = Some(verification);
+            let draft = if report.speech.is_some() {
+                let (draft, verification) = verification::finish(
+                    app,
+                    session,
+                    connection,
+                    message,
+                    &utterances,
+                    &gaps,
+                    draft,
+                )
+                .await?;
+                report.verification = Some(verification);
+                draft
+            } else {
+                report.review_notes.push(
+                    "Local audio verification requires local Whisper. Preview the cuts before applying.".into(),
+                );
+                draft
+            };
             report.proposals = draft.proposals;
             report.draft_summary = Some(draft.summary);
             report.review_notes.extend(draft.notes);
@@ -806,7 +906,7 @@ async fn proposals(
         let reviewed = assistant::review(
             app,
             session,
-            &connection,
+            connection,
             &transcript.utterances,
             &utterances,
             &gaps,
@@ -837,7 +937,7 @@ async fn proposals(
             "Comparing repeated takes with your provider",
             None,
         );
-        match retake_proposals(&connection, &utterances, &session.control.cancel).await {
+        match retake_proposals(connection, &utterances, &session.control.cancel).await {
             Ok(draft) => {
                 report.proposals.extend(draft.proposals);
                 report.review_notes.extend(draft.notes);
@@ -1012,6 +1112,39 @@ pub(crate) fn cleanup_cancel(state: State<'_, CleanupJobs>, id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audits_keep_each_run_and_never_recreate_a_deleted_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let first = serde_json::json!({"timelineKey":"first", "planning":{"passes":[{"validation":"Rejected overlapping cut"}]}});
+        let failed = serde_json::json!({"timelineKey":"second", "error":"Provider unavailable"});
+        save_cleanup_audit(&workspace, "../project", "first/job", &first).unwrap();
+        save_cleanup_audit(&workspace, "../project", "second/job", &failed).unwrap();
+        let history: Vec<_> = std::fs::read_dir(workspace.join("cleanup-reviews"))
+            .unwrap()
+            .collect();
+        assert_eq!(history.len(), 2);
+        let latest = workspace.join(format!(
+            "cleanup-review-{:x}.json",
+            Sha256::digest(b"../project")
+        ));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(latest).unwrap()).unwrap(),
+            failed
+        );
+        assert!(history.iter().any(|entry| {
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(entry.as_ref().unwrap().path()).unwrap(),
+            )
+            .unwrap()
+                == first
+        }));
+        std::fs::remove_dir_all(&workspace).unwrap();
+        assert!(save_cleanup_audit(&workspace, "project", "later", &first).is_err());
+        assert!(!workspace.exists());
+    }
 
     #[test]
     fn projects_reused_and_trimmed_sources_into_timeline_order() {

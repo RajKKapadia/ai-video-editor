@@ -38,7 +38,7 @@ function validReport(value: unknown): value is CleanupReport {
     (proposal.keep == null || validRange(proposal.keep)) && optionalText(proposal.reason) &&
     optionalText(proposal.removedText) && optionalText(proposal.keptText)) &&
     optionalText(report.retakeIssue) && optionalText(report.transcriptCacheIssue) &&
-    optionalText(report.runtimeNotice) && optionalText(report.draftSummary) &&
+    optionalText(report.processingDevice) && optionalText(report.runtimeNotice) && optionalText(report.draftSummary) &&
     (report.speech == null || (typeof report.speech.model === 'string' && Object.prototype.hasOwnProperty.call(whisperModels, report.speech.model) &&
       (report.speech.device == null || typeof report.speech.device.name === 'string'))) &&
     (report.reviewNotes === undefined || (Array.isArray(report.reviewNotes) && report.reviewNotes.every((note) => typeof note === 'string'))) &&
@@ -47,7 +47,21 @@ function validReport(value: unknown): value is CleanupReport {
       ['checked', 'partial'].includes(report.verification.status) &&
       [report.verification.checkedPreviews, report.verification.rejectedEdits, report.verification.unresolvedEdits]
         .every((value) => Number.isInteger(value) && value >= 0))) &&
-    Number.isInteger(report.failedSources) && report.failedSources >= 0;
+    Number.isInteger(report.failedSources) && report.failedSources >= 0 && validPlanning(report.planning);
+}
+
+function validPlanning(value: CleanupReport['planning']): boolean {
+  if (value === undefined) return true;
+  const count = (n: number) => Number.isSafeInteger(n) && n >= 0;
+  return !!value && ['fullTimeline', 'sections'].includes(value.strategy) && typeof value.timelineKey === 'string' &&
+    count(value.totalUtterances) && count(value.reviewedUtterances) && value.reviewedUtterances <= value.totalUtterances &&
+    count(value.contextBudgetTokens) && count(value.outputBudgetTokens) &&
+    (value.fallbackReason === null || typeof value.fallbackReason === 'string') && Array.isArray(value.reviews) &&
+    value.reviews.every((entry) => entry && typeof entry.scope === 'string' &&
+      Number.isFinite(entry.start) && Number.isFinite(entry.end) && entry.start >= 0 && entry.end >= entry.start &&
+      count(entry.utterances) && count(entry.edits) && typeof entry.completed === 'boolean' &&
+      (entry.error === null || typeof entry.error === 'string') && Array.isArray(entry.passes) &&
+      entry.passes.every((pass) => pass && count(pass.inputBytes) && count(pass.estimatedInputTokens) && typeof pass.validation === 'string'));
 }
 
 // JSON restores separate arrays for the saved snapshot and the project timeline.
