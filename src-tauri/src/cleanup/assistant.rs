@@ -1,5 +1,6 @@
 mod chunks;
 pub(super) mod draft;
+mod joins;
 pub(crate) mod planning;
 mod selections;
 
@@ -529,8 +530,10 @@ fn removes_all_speech(proposals: &[Proposal], utterances: &[TimelineUtterance<'_
         })
 }
 
-fn conflicts(left: &Proposal, right: &Proposal) -> bool {
-    left.remove.overlaps(right.remove)
+pub(super) fn conflicts(left: &Proposal, right: &Proposal) -> bool {
+    // A measured pause can overlap the padding of a speech cut and remain
+    // independently usable if the speech cut is rejected.
+    (left.kind == "pause") == (right.kind == "pause") && left.remove.overlaps(right.remove)
         // Adjacent removals form one edit. Separated removals must not strand
         // an audible micro-fragment between joins; preserve it for review.
         || {
