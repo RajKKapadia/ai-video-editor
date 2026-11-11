@@ -9,7 +9,7 @@ Cutline is a desktop video editor for assembling footage, cleaning up spoken rec
 ## Features
 
 - **Timeline editing.** Import video and audio, mark source ranges, split or replace clips, and undo edits. Linked audio follows its video cuts, and waveforms help you find edit points.
-- **Speech cleanup.** Transcribe and align words locally with Whisper, then use the desktop assistant to draft cuts for false starts, repeated words and takes, and quiet gaps. The agent audits its draft, preserves unique details, and explains any edits it cannot safely place. Review, preview, apply, and Undo the cuts together. Drafting sends your brief, transcript, and timing evidence to your configured AI provider.
+- **Speech cleanup.** Transcribe and align words locally with Whisper, then draft cuts for false starts, repeated speech, and quiet gaps. Adaptive cleanup can connect partial attempts and compare overlapping words. It checks assembled audio locally, reconsiders failed connections, and explains unresolved edits. Review, preview, apply, and Undo the cuts together. Drafting sends your brief, transcript, timing, and verification feedback to your configured AI provider.
 - **MP4 export.** Render up to 4K with selectable frame rate and quality. The desktop app uses NVIDIA hardware encoding when available and falls back to the CPU.
 
 ## Quick start

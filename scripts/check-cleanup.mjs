@@ -82,9 +82,11 @@ try {
               retakeIssue: mode === "partial" ? "The AI provider timed out." : null,
               ...(stage === "draft" && { draftSummary: "Review the proposed edits." }),
               ...(stage === "draft" && mode === "quiet" && { canClearTimeline: true }),
+              ...(stage === "draft" && mode === "splice" && { verification: { status: "checked", checkedPreviews: 2, rejectedEdits: 0, unresolvedEdits: 0 } }),
               ...(stage === "chat" && { assistantTurn: [{ id: 1, role: "assistant", text: "Transcript answer" }] }),
               proposals: stage === "draft" && mode === "quiet" ? [{ ...pause, remove: { start: 0, end: 4 } }] : stage === "draft" ? (
-                mode === "invalid" ? [{ ...pause, remove: { start: .01, end: 1.3 } }] :
+                mode === "splice" ? [{ ...retake, kind: "splice", reason: "Connect the partial attempt to its continuation" }] :
+                mode === "invalid" ? [{ ...pause, kind: "cut", remove: { start: .01, end: 1.3 } }] :
                 mode === "empty" ? [] : [pause, retake]
               ) : stage === "chat" ? [] : stage === "cuts" ? [retake] :
                 mode === "success" && !stage ? [pause, retake] : [pause],
@@ -190,8 +192,12 @@ try {
     "sessionStorage.setItem('mockProjectCache', JSON.stringify(snapshot)); window.reloadingAssistantCheck = true;})()");
   await browser.send('Page.reload');
   await waitFor("!window.reloadingAssistantCheck && !!document.querySelector('.editor-shell')");
-  await click('Assistant');
+  await openCleanup();
+  await click('Draft adaptive cleanup');
   await waitFor("document.querySelector('.assistant-panel')?.textContent.includes('test-model')");
+  await waitFor("document.querySelectorAll('.cleanup-results li').length === 2");
+  assert.equal(await evaluate("assistantRequests[0].stage"), 'draft');
+  assert.deepEqual(await savedTimeline(), before);
   assert.equal(await evaluate("document.querySelector('.assistant-advanced').open"), false);
 
   await click('Draft cleanup');
@@ -258,6 +264,19 @@ try {
   assert.deepEqual(await savedTimeline(), before);
   await click('Apply selected');
   await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 0");
+  await evaluate("document.querySelector('[aria-label=\"Undo timeline edit\"]').click()");
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 2");
+  assert.deepEqual(await savedTimeline(), before);
+
+  await evaluate("cleanupMock.mode = 'splice'");
+  await click('Draft cleanup');
+  await waitFor("document.querySelector('.assistant-panel')?.textContent.includes('Fragment connection')");
+  assert.equal(await evaluate("document.querySelector('.assistant-panel').textContent.includes('2 local audio previews checked.')"), true);
+  await click('Select all retakes');
+  await reloadReview('.assistant-panel', 1, 1);
+  assert.equal(await evaluate("document.querySelector('.assistant-panel').textContent.includes('Fragment connection')"), true);
+  await click('Apply selected');
+  await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 3");
   await evaluate("document.querySelector('[aria-label=\"Undo timeline edit\"]').click()");
   await waitFor("JSON.parse(sessionStorage.getItem('mockProjectCache')).projects[0].timeline.length === 2");
   assert.deepEqual(await savedTimeline(), before);

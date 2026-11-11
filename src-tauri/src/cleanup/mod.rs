@@ -7,6 +7,7 @@ pub(crate) mod providers;
 #[cfg(test)]
 mod reliability;
 pub(crate) mod speech;
+mod verification;
 pub(crate) mod worker;
 
 use std::{
@@ -187,6 +188,8 @@ struct Data {
     pending: HashSet<String>,
     failed: HashSet<String>,
     results: Vec<Option<Arc<Analysis>>>,
+    verification_models: Option<(PathBuf, PathBuf)>,
+    verification_sources: std::collections::HashMap<String, verification::Source>,
     working: bool,
 }
 
@@ -362,6 +365,7 @@ async fn setup(
     };
     let mut data = session.data.lock().unwrap();
     session.control.check()?;
+    data.verification_models = whisper.as_ref().map(|path| (vad.clone(), path.clone()));
     data.pipeline = Some(Pipeline::start(
         app.clone(),
         session.clone(),
@@ -579,6 +583,8 @@ pub(crate) struct Report {
     draft_summary: Option<String>,
     review_notes: Vec<String>,
     can_clear_timeline: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<verification::Summary>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -642,7 +648,7 @@ pub(crate) async fn cleanup_finish(app: AppHandle, id: String) -> Result<Report,
 
 async fn proposals(
     app: &AppHandle,
-    session: &Session,
+    session: &Arc<Session>,
     results: Vec<Option<Arc<Analysis>>>,
     connection: Option<Connection>,
     retake_issue: Option<String>,
@@ -668,6 +674,7 @@ async fn proposals(
         draft_summary: None,
         review_notes: Vec::new(),
         can_clear_timeline: false,
+        verification: None,
     };
     let drafting = session
         .assistant
@@ -780,6 +787,17 @@ async fn proposals(
                     return Ok(report);
                 }
             };
+            let (draft, verification) = verification::finish(
+                app,
+                session,
+                &connection,
+                message,
+                &utterances,
+                &gaps,
+                draft,
+            )
+            .await?;
+            report.verification = Some(verification);
             report.proposals = draft.proposals;
             report.draft_summary = Some(draft.summary);
             report.review_notes.extend(draft.notes);
@@ -884,7 +902,7 @@ async fn retake_proposals(
 ) -> Result<assistant::draft::Draft, String> {
     let mut draft = assistant::draft::run(
         connection,
-        "Find repeated takes and repeated phrases, including repetitions inside a single utterance. Remove only redundant versions, using kind retake with the kept version identified. Choose the clearest complete version and retain all unique information and intentional repetitions. Do not remove unrelated recording chatter, false starts without a repeated version, or quiet gaps in this operation.",
+        "Find repeated takes and repeated phrases, including repetitions inside a single utterance. Remove only redundant versions, using kind retake with the kept version identified. You can also select a measured join within one utterance to remove a repeated phrase. Choose the clearest complete version and retain all unique information and intentional repetitions. Preserve unrelated recording chatter, false starts without a repeated version, and quiet gaps in this operation.",
         utterances, &[], cancel,
     ).await?;
     let count = draft.proposals.len();

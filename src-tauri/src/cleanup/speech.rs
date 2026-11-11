@@ -52,7 +52,7 @@ pub(crate) enum Processing {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Config {
     preference: Preference,
     processing: Processing,
@@ -72,9 +72,18 @@ pub(crate) struct Benchmark {
 }
 
 #[derive(Default, Deserialize, Serialize)]
+struct StoredConfig {
+    #[serde(flatten)]
+    local: Config,
+    // Other Cutline builds can share this file and select an engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine: Option<serde_json::Value>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
 struct Settings {
     #[serde(default)]
-    config: Config,
+    config: StoredConfig,
     #[serde(default)]
     benchmarks: Vec<Benchmark>,
 }
@@ -313,11 +322,11 @@ fn available_device(
                 && test.failed_device.as_deref() == Some(&device.name)
         })
     });
-    device_for(model, &eligible, settings.config.processing)
+    device_for(model, &eligible, settings.config.local.processing)
 }
 
 fn select(settings: &Settings, hardware: &Hardware) -> Selection {
-    let config = &settings.config;
+    let config = &settings.config.local;
     let mut reason =
         "Selected explicitly; the model will remain fixed if processing falls back to CPU."
             .to_owned();
@@ -392,7 +401,7 @@ fn status(app: &AppHandle) -> Result<Status, String> {
         })
         .collect();
     Ok(Status {
-        config: settings.config,
+        config: settings.config.local,
         hardware,
         selection,
         models,
@@ -419,7 +428,7 @@ pub(crate) async fn speech_save(app: AppHandle, config: Config) -> Result<Status
             let _lock = store.lock.lock().unwrap();
             let path = path(&app)?;
             let mut settings = load(&path)?;
-            settings.config = config;
+            settings.config.local = config;
             save(&path, &settings)?;
         }
         status(&app)
@@ -570,7 +579,7 @@ pub(super) async fn prepare(
                         WhisperModel::Small => None,
                     };
                     if attempt == 0
-                        && settings.config.preference.fixed().is_none()
+                        && settings.config.local.preference.fixed().is_none()
                         && let Some(model) = smaller
                     {
                         let device = available_device(&settings, &hardware, model);
@@ -622,7 +631,7 @@ pub(super) async fn prepare(
             selection.benchmark = Some(test);
         }
         if attempt == 0
-            && settings.config.preference == Preference::AutoBalanced
+            && settings.config.local.preference == Preference::AutoBalanced
             && selection
                 .benchmark
                 .as_ref()
@@ -666,7 +675,7 @@ mod tests {
     #[test]
     fn explicit_large_is_preserved_without_gpu() {
         let mut settings = Settings::default();
-        settings.config.preference = Preference::LargeV3;
+        settings.config.local.preference = Preference::LargeV3;
         let selected = select(&settings, &hardware_with(64 * GIB, 20));
         assert_eq!(selected.model, WhisperModel::LargeV3);
         assert!(selected.device.is_none());
@@ -683,7 +692,7 @@ mod tests {
             WhisperModel::LargeV3Turbo
         );
         let mut settings = Settings::default();
-        settings.config.preference = Preference::AutoAccuracy;
+        settings.config.local.preference = Preference::AutoAccuracy;
         assert_eq!(
             select(&settings, &hardware_with(16 * GIB, 4)).model,
             WhisperModel::LargeV3
@@ -726,7 +735,7 @@ mod tests {
             },
         ];
         let mut settings = Settings::default();
-        settings.config.preference = Preference::LargeV3;
+        settings.config.local.preference = Preference::LargeV3;
         settings.benchmarks.push(Benchmark {
             fingerprint: "test".into(),
             model: WhisperModel::LargeV3,
@@ -765,12 +774,12 @@ mod tests {
             failed_device: None,
         });
         assert_eq!(select(&settings, &hardware).model, WhisperModel::Medium);
-        settings.config.preference = Preference::LargeV3Turbo;
+        settings.config.local.preference = Preference::LargeV3Turbo;
         assert_eq!(
             select(&settings, &hardware).model,
             WhisperModel::LargeV3Turbo
         );
-        settings.config.preference = Preference::AutoBalanced;
+        settings.config.local.preference = Preference::AutoBalanced;
         settings.benchmarks[0].fingerprint = "old-machine".into();
         assert_eq!(
             select(&settings, &hardware).model,
@@ -782,12 +791,30 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("settings.json");
         let mut settings = load(&path).unwrap();
-        settings.config.preference = Preference::LargeV3;
+        settings.config.local.preference = Preference::LargeV3;
         save(&path, &settings).unwrap();
-        assert_eq!(load(&path).unwrap().config.preference, Preference::LargeV3);
+        assert_eq!(
+            load(&path).unwrap().config.local.preference,
+            Preference::LargeV3
+        );
         assert!(
             serde_json::from_str::<Config>(r#"{"preference":"large-v4","processing":"auto"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reads_and_preserves_the_engine_setting_from_other_builds() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("speech-settings.json");
+        fs::write(&path, r#"{"config":{"engine":"openAi","preference":"largeV3","processing":"cpu"},"benchmarks":[]}"#).unwrap();
+        let mut settings = load(&path).unwrap();
+        assert_eq!(settings.config.local.preference, Preference::LargeV3);
+        assert_eq!(settings.config.local.processing, Processing::Cpu);
+        settings.config.local.preference = Preference::Small;
+        save(&path, &settings).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["config"]["engine"], "openAi");
+        assert_eq!(saved["config"]["preference"], "small");
     }
 }

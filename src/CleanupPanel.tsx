@@ -15,6 +15,7 @@ type Props = {
   onClose: () => void;
   onSettings: (tab?: 'speech' | 'providers') => void;
   onAnalyze: (options: { pauses: boolean; retakes: ProviderSelection | null }) => void;
+  onAdaptive: (provider: ProviderSelection) => void;
   onCancel: () => void;
 } & CutReviewProps;
 
@@ -33,7 +34,7 @@ export type CutReviewProps = {
 };
 
 export function CleanupPanel({
-  providerRevision, progress, error, report, hasAudio, onClose, onSettings, onAnalyze, onCancel,
+  providerRevision, progress, error, report, hasAudio, onClose, onSettings, onAnalyze, onAdaptive, onCancel,
   ...review
 }: Props) {
   const [pauses, setPauses] = useState(true);
@@ -75,8 +76,19 @@ export function CleanupPanel({
           </div>
         ) : (
           <>
+            <div className="assistant-controls">
+              <p className="provider-note">Adaptive cleanup connects partial attempts, removes accidental repeats, and checks the assembled audio. Review the draft before applying.</p>
+              <p className="provider-note">{active && profile?.ready
+                ? <>Your transcript and timing go to {providers[active]} · {profile.model}. Audio checks run locally.</>
+                : 'Set up an AI provider to draft adaptive cleanup.'}
+                {' '}<button className="text-link" type="button" onClick={() => onSettings('providers')}>AI providers</button>
+              </p>
+              <button type="button" className="button primary" disabled={!hasAudio || !active || !profile?.ready || !!settingsError} onClick={() => {
+                if (active && profile?.ready) onAdaptive({ provider: active, config: { model: profile.model, baseUrl: profile.baseUrl } });
+              }}>Draft adaptive cleanup</button>
+            </div>
             <fieldset className="cleanup-options">
-              <legend>Analyze the entire sequence</legend>
+              <legend>Basic analysis</legend>
               <label><input type="checkbox" checked={pauses} onChange={(event) => setPauses(event.target.checked)} /> Shorten pauses</label>
               <label><input type="checkbox" checked={retakes} onChange={(event) => setRetakes(event.target.checked)} /> Remove repeated takes</label>
               {retakes && speech && <p className="provider-note">{whisperModels[speech.selection.model]} · {speech.selection.device?.name ?? 'CPU'} · <button className="text-link" type="button" onClick={() => onSettings('speech')}>Transcription settings</button></p>}
@@ -123,6 +135,12 @@ export function CutReview({
       {report.retakeIssue && <p className="cleanup-warning" role="status">{report.retakeIssue}</p>}
       {report.transcriptCacheIssue && <p className="cleanup-warning" role="status">{report.transcriptCacheIssue}</p>}
       {report.runtimeNotice && <p className="cleanup-warning" role="status">{report.runtimeNotice}</p>}
+      {report.verification && <p className="provider-note" role="status">
+        {report.verification.checkedPreviews > 0 && `${report.verification.checkedPreviews} local audio previews checked. `}
+        {report.verification.status === 'partial' && `${report.verification.unresolvedEdits} unresolved edits were left unchanged. `}
+        {report.proposals.some((proposal) => proposal.kind === 'pause') && 'Quiet cuts use measured audio gaps. '}
+        Preview your selection to check the flow.
+      </p>}
       {report.reviewNotes?.map((note, index) => <p className="cleanup-warning" role="status" key={index}>{note}</p>)}
       {report.canClearTimeline && <p className="provider-note">All analyzed audio is quiet. Applying every removal will clear the timeline. Undo restores it.</p>}
       {report.speech && <p className="provider-note">Transcribed with {whisperModels[report.speech.model]} · {report.speech.device?.name ?? 'CPU'}</p>}
@@ -141,7 +159,7 @@ export function CutReview({
           {report.proposals.some((proposal) => proposal.kind === 'pause') && (
             <button type="button" className="text-link" onClick={onSelectPauses}>Select all pauses</button>
           )}
-          {report.proposals.some((proposal) => proposal.kind === 'retake' || proposal.kind === 'cut') && (
+          {report.proposals.some((proposal) => proposal.kind !== 'pause') && (
             <button type="button" className="text-link" title="Select repeated takes, false starts, and other transcript cuts" onClick={onSelectRetakes}>Select all retakes</button>
           )}
           <button type="button" className="text-link" disabled={!checked.size} onClick={onClearSelection}>Clear selection</button>
@@ -153,7 +171,7 @@ export function CutReview({
             <li key={index}>
               <label>
                 <input type="checkbox" checked={checked.has(index)} onChange={() => onToggle(index)} />
-                <span>{proposal.kind === 'pause' ? 'Quiet pause' : proposal.kind === 'retake' ? 'Repeated take' : 'Transcript cut'}</span>
+                <span>{proposal.kind === 'pause' ? 'Quiet pause' : proposal.kind === 'retake' ? 'Repeated take' : proposal.kind === 'splice' ? 'Fragment connection' : 'Transcript cut'}</span>
               </label>
               <p className="cleanup-range">
                 {timecode(proposal.remove.start)} – {timecode(proposal.remove.end)} · {(proposal.remove.end - proposal.remove.start).toFixed(2)} s

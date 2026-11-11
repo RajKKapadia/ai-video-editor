@@ -352,6 +352,15 @@ pub(super) struct Detected {
 }
 
 impl Detected {
+    // Audition the assembled window as one sequence. VAD segmentation must not
+    // hide a defective seam by recognizing its two sides independently.
+    pub(super) fn audition(duration: f64) -> Self {
+        Self {
+            duration,
+            speech: vec![Range::new(0.0, duration)],
+            quiet: Vec::new(),
+        }
+    }
     pub fn reuse(
         &self,
         duration: f64,
@@ -456,47 +465,34 @@ impl Detected {
     }
 
     pub fn pauses(&self) -> Vec<Range> {
-        let mut gaps = Vec::with_capacity(self.speech.len() + 1);
-        let mut cursor = 0.0;
-        for speech in &self.speech {
-            gaps.push(Range::new(cursor, speech.start));
-            cursor = speech.end;
+        let mut pauses = Vec::new();
+        let mut quiet = self.quiet.iter().peekable();
+        let mut gap_start = 0.0_f64;
+        for speech in self
+            .speech
+            .iter()
+            .copied()
+            .chain(std::iter::once(Range::new(self.duration, self.duration)))
+        {
+            while let Some(interval) = quiet.peek().filter(|range| range.start < speech.start) {
+                let start = gap_start.max(interval.start);
+                let end = speech.start.min(interval.end);
+                if end - start + TIME_EPSILON >= MIN_QUIET_GAP {
+                    // Preserve speech edges and audible sounds that split a quiet interval.
+                    let padding = |at_edge| if at_edge { 0.0 } else { BOUNDARY_PADDING };
+                    pauses.push(Range::new(
+                        start + padding(start <= TIME_EPSILON),
+                        end - padding(self.duration - end <= TIME_EPSILON),
+                    ));
+                }
+                if interval.end > speech.start {
+                    break;
+                }
+                quiet.next();
+            }
+            gap_start = speech.end;
         }
-        gaps.push(Range::new(cursor, self.duration));
-        gaps.into_iter()
-            .filter_map(|gap| {
-                if gap.duration() + TIME_EPSILON < MIN_QUIET_GAP {
-                    return None;
-                }
-                // Use the quiet interval through the middle of the gap. The detector can
-                // miss breaths and low consonants near its boundaries, so retain those too.
-                let middle = (gap.start + gap.end) * 0.5;
-                let quiet = self
-                    .quiet
-                    .get(self.quiet.partition_point(|quiet| quiet.end < middle))?;
-                if quiet.start > middle
-                    || quiet.start > gap.start + 0.5
-                    || quiet.end < gap.end - 0.5
-                {
-                    return None;
-                }
-                let gap = Range::new(gap.start.max(quiet.start), gap.end.min(quiet.end));
-                (gap.duration() + TIME_EPSILON >= MIN_QUIET_GAP).then_some(Range::new(
-                    gap.start
-                        + if gap.start <= TIME_EPSILON {
-                            0.0
-                        } else {
-                            BOUNDARY_PADDING
-                        },
-                    gap.end
-                        - if self.duration - gap.end <= TIME_EPSILON {
-                            0.0
-                        } else {
-                            BOUNDARY_PADDING
-                        },
-                ))
-            })
-            .collect()
+        pauses
     }
 
     fn before(&self, speech_start: f64) -> Option<f64> {
@@ -745,7 +741,7 @@ mod tests {
 
     #[test]
     fn shortens_quiet_gaps_including_recording_edges() {
-        let mut detected = Detected {
+        let detected = Detected {
             duration: 9.0,
             speech: vec![
                 Range::new(1.0, 2.0),
@@ -773,8 +769,19 @@ mod tests {
         let pause = detected.pauses()[1];
         assert_eq!(detected.after(2.0, detected.duration), Some(pause.start));
         assert_eq!(detected.before(3.0), Some(pause.end));
-        detected.speech.clear();
-        assert!(detected.pauses().is_empty());
+    }
+
+    #[test]
+    fn keeps_the_sound_between_two_quiet_intervals() {
+        let detected = Detected {
+            duration: 8.0,
+            speech: vec![Range::new(0.0, 2.0), Range::new(6.0, 8.0)],
+            quiet: vec![Range::new(2.0, 3.8), Range::new(4.2, 6.0)],
+        };
+        assert_eq!(
+            detected.pauses(),
+            vec![Range::new(2.15, 3.8 - 0.15), Range::new(4.2 + 0.15, 5.85)]
+        );
     }
 
     #[test]

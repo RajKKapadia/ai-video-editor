@@ -203,7 +203,24 @@ fn decode(
                 return session.control.check();
             }
         }
-        drop(input);
+        // Keep authorized source handles alive for local audition, including legacy
+        // upload scratch files. They are released with the job on finish/cancel.
+        if session
+            .assistant
+            .as_ref()
+            .is_some_and(|(stage, _)| *stage == super::assistant::Stage::Draft)
+        {
+            let linked_revision = revision
+                .as_ref()
+                .and_then(|revision| revision.linked.as_ref().map(|_| revision.key.clone()));
+            session.data.lock().unwrap().verification_sources.insert(
+                clip_id,
+                super::verification::Source {
+                    input: Arc::new(input),
+                    revision: linked_revision,
+                },
+            );
+        }
         if let Some(released) = released {
             session.data.lock().unwrap().staged = false;
             let _ = released.send(());

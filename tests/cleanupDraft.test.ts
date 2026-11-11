@@ -78,4 +78,19 @@ describe('saved cleanup drafts', () => {
     expect(remainingCleanupReview(overlapping, new Set([0]), edit)).toBeNull();
     expect(remainingCleanupReview(review, new Set([0, 1]), makeCleanupEdit(timeline, review.report.proposals.map(({ remove }) => remove))!)).toBeNull();
   });
+
+  test('restores fragment connections and audio checks but invalidates checks after partial application', () => {
+    const verified = roundtrip(saved);
+    verified.review!.report.proposals[1].kind = 'splice';
+    verified.review!.report.verification = { status: 'checked', checkedPreviews: 3, rejectedEdits: 0, unresolvedEdits: 0 };
+    const restored = restoreCleanupDraft(verified, timeline)!;
+    expect(restored.review!.report.verification?.checkedPreviews).toBe(3);
+    const edit = makeCleanupEdit(timeline, [review.report.proposals[0].remove])!;
+    const remaining = remainingCleanupReview(restored.review!, new Set([0]), edit)!;
+    expect(remaining.report.proposals[0].kind).toBe('splice');
+    expect(remaining.report.verification).toBeUndefined();
+    expect(remaining.report.reviewNotes?.join(' ')).toContain('earlier timeline');
+    verified.review!.report.verification.checkedPreviews = -1;
+    expect(restoreCleanupDraft(verified, timeline)).toBeNull();
+  });
 });

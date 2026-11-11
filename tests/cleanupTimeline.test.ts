@@ -9,6 +9,16 @@ const original: Segment[] = [
 ];
 
 describe('cleanup timeline', () => {
+  test('invalidates full-draft audio checks when frame validation changes the assembly', () => {
+    const report: CleanupReport = {
+      proposals: [{ kind: 'splice', remove: { start: .01, end: 1 }, keep: null, removedText: null, keptText: null }],
+      verification: { status: 'checked', checkedPreviews: 1, rejectedEdits: 0, unresolvedEdits: 0 },
+      failedSources: 0, retakeIssue: null, transcriptCacheIssue: null,
+    };
+    const reviewed = prepareCleanupReview(original, report);
+    expect(reviewed.proposals).toHaveLength(0);
+    expect(reviewed.verification).toBeUndefined();
+  });
   test('ripple edits timeline occurrences independently and preserves source offsets', () => {
     const edit = makeCleanupEdit(original, [{ start: 8, end: 9 }])!;
     expect(edit.timeline.slice(0, 2)).toEqual(original.slice(0, 2));
@@ -72,5 +82,18 @@ describe('cleanup timeline', () => {
     expect(reviewed.proposals.map(({ remove }) => remove)).toEqual([{ start: 2, end: 3 }]);
     expect(reviewed.reviewNotes?.length).toBe(1);
     expect(canPreviewCleanupDraft(original, reviewed)).toBe(true);
+  });
+
+  test('keeps a full frame by shortening a measured silence removal at clip edges', () => {
+    const report: CleanupReport = {
+      draftSummary: 'Draft', failedSources: 0, retakeIssue: null, transcriptCacheIssue: null,
+      proposals: [{ kind: 'pause', remove: { start: 0.02, end: 3.97 }, keep: null, keptText: null, removedText: null }],
+    };
+    const reviewed = prepareCleanupReview(original, report);
+    expect(reviewed.proposals).toHaveLength(1);
+    const removal = reviewed.proposals[0].remove;
+    expect(removal.start).toBeCloseTo(1 / 24, 8);
+    expect(removal.end).toBeCloseTo(4 - 1 / 24, 8);
+    expect(makeCleanupEdit(original, [removal])?.secondsRemoved).toBeCloseTo(4 - 2 / 24, 8);
   });
 });

@@ -6,7 +6,7 @@ const epsilon = 0.000001;
 
 export type TimeRange = { start: number; end: number };
 export type CleanupProposal = {
-  kind: 'pause' | 'retake' | 'cut';
+  kind: 'pause' | 'retake' | 'cut' | 'splice';
   remove: TimeRange;
   keep: TimeRange | null;
   removedText: string | null;
@@ -25,6 +25,12 @@ export type CleanupReport = {
   draftSummary?: string;
   reviewNotes?: string[];
   canClearTimeline?: boolean;
+  verification?: {
+    status: 'checked' | 'partial';
+    checkedPreviews: number;
+    rejectedEdits: number;
+    unresolvedEdits: number;
+  };
 };
 
 export function canPreviewCleanupDraft(timeline: Segment[], report: CleanupReport) {
@@ -38,10 +44,14 @@ export function canPreviewCleanupDraft(timeline: Segment[], report: CleanupRepor
 
 export function prepareCleanupReview(timeline: Segment[], report: CleanupReport): CleanupReport {
   const notes = [...report.reviewNotes ?? []];
-  let proposals = report.proposals.filter((proposal) => {
-    if (makeCleanupEdit(timeline, [proposal.remove], report.canClearTimeline)) return true;
+  let proposals = report.proposals.flatMap((proposal) => {
+    if (makeCleanupEdit(timeline, [proposal.remove], report.canClearTimeline)) return [proposal];
+    if (proposal.kind === 'pause') {
+      const remove = fitPauseToClipEdges(timeline, proposal.remove);
+      if (makeCleanupEdit(timeline, [remove], report.canClearTimeline)) return [{ ...proposal, remove }];
+    }
     notes.push(`The proposed removal at ${proposal.remove.start.toFixed(2)}–${proposal.remove.end.toFixed(2)} s was left unchanged because it would leave a fragment shorter than one frame.`);
-    return false;
+    return [];
   });
   if (proposals.length && !makeCleanupEdit(timeline, proposals.map(({ remove }) => remove), report.canClearTimeline)) {
     const conflicting = new Set<number>();
@@ -61,7 +71,30 @@ export function prepareCleanupReview(timeline: Segment[], report: CleanupReport)
     proposals = retained;
     notes.push('Some proposed cuts were left unchanged because applying them together would leave an empty sequence or a fragment shorter than one frame.');
   }
+  if (report.verification && proposals.length !== report.proposals.length) {
+    const { verification: _verification, ...unverifiedReport } = report;
+    notes.push('Some edits changed during timeline validation. Preview this selection or analyze again to repeat the audio checks.');
+    return { ...unverifiedReport, proposals, reviewNotes: notes };
+  }
   return { ...report, proposals, reviewNotes: notes };
+}
+
+function fitPauseToClipEdges(timeline: Segment[], range: TimeRange): TimeRange {
+  let { start, end } = range;
+  let clipStart = 0;
+  for (const segment of timeline) {
+    const clipEnd = clipStart + segmentLength(segment);
+    if (start > clipStart + epsilon && start < clipEnd - epsilon) {
+      start = Math.max(start, Math.min(clipStart + minSegmentDuration, clipEnd));
+    }
+    if (end > clipStart + epsilon && end < clipEnd - epsilon) {
+      end = Math.min(end, Math.max(clipEnd - minSegmentDuration, clipStart));
+      break;
+    }
+    clipStart = clipEnd;
+  }
+  // Move inward so the cut remains inside the measured quiet interval.
+  return { start, end };
 }
 
 export function makeCleanupEdit(timeline: Segment[], ranges: TimeRange[], allowEmpty = false) {

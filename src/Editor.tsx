@@ -14,7 +14,7 @@ import { CleanupPanel } from './CleanupPanel';
 import { remainingCleanupReview, restoreCleanupDraft, type CleanupReview, type SavedCleanupDraft } from './cleanupDraft';
 import { ExportPanel } from './ExportPanel';
 import { Icon, type IconName } from './Icon';
-import { analyzeTimeline, errorMessage, hasAnalyzableAudio, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
+import { adaptiveCleanupBrief, analyzeTimeline, errorMessage, hasAnalyzableAudio, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
 import { canPreviewCleanupDraft, makeCleanupEdit, minSegmentDuration, prepareCleanupReview, type AssistantMessage, type TimeRange } from './cleanupTimeline';
 import { inspectMedia, storeMedia } from './cache';
 import { importConcurrency, mapConcurrent } from './resources';
@@ -1547,6 +1547,11 @@ export function Editor({
             onClose={closeCleanup}
             onSettings={onSettings}
             onAnalyze={(options) => void runCleanup(options)}
+            onAdaptive={(provider) => {
+              setCleanupOpen(false);
+              setAiOpen(true);
+              runAssistant({ stage: 'draft', message: adaptiveCleanupBrief, provider });
+            }}
             onCancel={cancelCleanup}
             {...cutReview}
           />

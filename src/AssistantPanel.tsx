@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { CutReview, CutReviewActions, type CutReviewProps } from './CleanupPanel';
 import { Icon } from './Icon';
 import {
-  errorMessage, providers,
+  adaptiveCleanupBrief, errorMessage, providers,
   type AssistantRequest, type CleanupProgress, type ProviderStatus,
 } from './cleanupNative';
 import type { AssistantMessage, CleanupReport } from './cleanupTimeline';
@@ -90,7 +90,7 @@ export function AssistantPanel({
       </div>
       <div className="cleanup-body">
         <div className="assistant-controls">
-          <p className="provider-note">Draft cleanup for the entire sequence: false starts, repeated words and takes, and quiet gaps. Preview and apply the cuts you choose.</p>
+          <p className="provider-note">Connect partial attempts, remove accidental repeats, and tighten unwanted gaps. The draft checks assembled audio before review. Preview and apply the cuts you choose.</p>
           <p className="provider-note">
             {ready && active && profile
               ? <>Whisper runs locally. Your brief, transcript, and timing go to {providers[active]} · {profile.model}{profile.baseUrl ? ' · ' + profile.baseUrl : ''}. Transcript questions and Advanced analysis also send recent conversation.</>
@@ -114,7 +114,7 @@ export function AssistantPanel({
               disabled={!!progress}
             />
             <div className="assistant-actions">
-              <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', 'Remove clear false starts, repeated words or passages, recording count-ins, and dispensable quiet gaps. Keep the clearest complete take. Preserve unique details, intentional pauses, and time used for demonstrations.')}>
+              <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', adaptiveCleanupBrief)}>
                 Draft cleanup
               </button>
               <button type="submit" className="button secondary" disabled={!canRun || !prompt.trim()}>Ask about transcript</button>

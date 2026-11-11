@@ -1,6 +1,6 @@
 # Cleanup reliability
 
-The desktop assistant cleans quiet gaps, recording false starts, and repeated words or takes. Its default brief preserves intentional pauses and unique information, and selects the clearest complete wording. Suggestions require review and explicit application.
+The desktop assistant cleans quiet gaps, recording false starts, and repeated words or takes. Its default brief preserves intentional pauses and unique information and can connect partial attempts to continuations. Suggestions require review and explicit application. The adaptive draft now includes local assembled-audio checks; [Adaptive cutting](adaptive-cutting.md) documents their scope and limits separately from the historical verification below.
 
 ## Implemented behavior
 

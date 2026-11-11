@@ -15,6 +15,7 @@ const PLANNING_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_INSPECT_UTTERANCES: usize = 24;
 const MAX_PROPOSALS: usize = 100;
 const INVALID_REPLY: &str = "The AI provider returned an invalid cleanup draft.";
+const TIMEOUT: &str = "Cleanup planning timed out. Try again with a shorter sequence.";
 const INVALID_DRAFT: &str =
     "The assistant could not produce a safe cleanup draft. Try narrowing your editing brief.";
 
@@ -24,13 +25,16 @@ const INSTRUCTIONS: &str = concat!(
     "Transcript rows are [utterance ID, start seconds, end seconds, source run ID, safe start, safe end, text, aligned word count]. ",
     "Quiet gap rows are [gap ID, preceding utterance ID, following utterance ID, removal start seconds, removal end seconds]. ",
     "You cannot see the footage. Preserve ambiguous material, unique information, intentional repetition and deliberate beats. ",
-    "Preserve gaps around instructions to look, wait, watch, read, listen or perform an action, during demonstrations, ",
-    "and whenever the gap may serve a purpose. A pause's length alone is insufficient evidence. ",
+    "Review each measured gap. Shorten dead air before a restart, between unrelated thoughts, and during recording setup. ",
+    "Preserve gaps where speech cues suggest a demonstration, time to read, a deliberate beat or a wait for a result. ",
+    "For example, 'click Run and wait' followed by 'the result is ready' implies an intentional gap. ",
+    "A long gap before the speaker repeats a sentence they abandoned is usually dispensable. ",
     "Propose only measured gap IDs or complete utterances with safe outer cut boundaries. ",
     "Consecutive utterances may cross existing timeline cuts; a run change does not mean a new take. ",
     "Gap context ID 0 means the beginning or end of the available speech. Remove recording lead-in and tail silence when dispensable. ",
     "When removing a repeated version of an utterance, always use kind retake and identify the complete kept range with all unique details. ",
-    "Choose the clearest complete version by wording and completeness, preferring the later version only when equally complete. ",
+    "Construct a flowing sequence from the available fragments; a complete thought may span multiple attempts. ",
+    "Preserve every necessary connecting word. Later attempts need not be complete or preferable. ",
     "The kept range may include utterances without safe cut boundaries. Use falseStart or recordingChatter for those edits and set keep to null. ",
     "Ranges use inclusive utterance IDs. Give a brief reason for each removal. ",
     "For a repeated phrase inside an utterance, inspect that utterance's word alignment before choosing a partial cut. ",
@@ -40,6 +44,14 @@ const INSTRUCTIONS: &str = concat!(
     "If needed, use action inspect with a window of up to 24 utterances, empty pauses and cuts, and an empty summary. ",
     "Details contain objects with id, speech, cutStart, cutEnd and words. Each word row is [one-based word index, start seconds, end seconds, text]. ",
     "When ready, or if asked to correct a proposal, use action propose with window null and a short summary of what the draft would change. ",
+    "joinAlternatives describe measured connections across fragments and repeated phrases within an utterance. ",
+    "Each option has an id, group, retained overlap side, removal range, removedText, and resulting wording. ",
+    "Compare the original, each complete attempt, and each possible assembly. Review all removedText, including any intervening attempt, for unique information. ",
+    "nearbyRetakeHints lists pairs of utterance IDs with shared keywords, including reworded attempts. Compare them by meaning. ",
+    "Use aligned word IDs to preserve details said only once. ",
+    "Choose at most one alternative per group in joins:[{id,reason}], only when the repetition is accidental and all necessary content survives. ",
+    "You can inspect words, choose a join, cut a false start, or preserve material in any order. ",
+    "Do not duplicate a join removal in cuts or pauses. Missing visual/audio evidence is not proof an edit is safe. ",
     "Empty proposal arrays are valid if nothing should be removed.",
 );
 
@@ -79,6 +91,8 @@ struct Step {
     summary: String,
     pauses: Vec<PauseChoice>,
     cuts: Vec<DraftCut>,
+    #[serde(default)]
+    joins: Vec<super::joins::Choice>,
 }
 
 pub(in crate::cleanup) struct Draft {
@@ -92,14 +106,16 @@ fn step_schema() -> Value {
     schema["properties"]["action"] = json!({"enum": ["inspect", "propose"], "type": "string"});
     schema["properties"]["window"] =
         json!({"anyOf": [super::utterance_range_schema(), {"type": "null"}]});
+    schema["properties"]["joins"] = super::joins::choice_schema();
     let cut = &mut schema["properties"]["cuts"]["items"];
     cut["properties"]["kind"] =
         json!({"enum": ["retake", "falseStart", "recordingChatter"], "type": "string"});
     cut["required"].as_array_mut().unwrap().push(json!("kind"));
-    schema["required"]
-        .as_array_mut()
-        .unwrap()
-        .extend([json!("action"), json!("window")]);
+    schema["required"].as_array_mut().unwrap().extend([
+        json!("action"),
+        json!("window"),
+        json!("joins"),
+    ]);
     schema
 }
 
@@ -188,9 +204,7 @@ where
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err("Timeline analysis cancelled.".into()),
-        result = tokio::time::timeout(timeout, steps(brief, utterances, gaps, complete)) => {
-            result.map_err(|_| "Cleanup planning timed out. Try again with a shorter sequence.")?
-        }
+        result = steps(brief, utterances, gaps, timeout, complete) => result,
     }
 }
 
@@ -198,12 +212,14 @@ async fn steps<F, Fut>(
     brief: &str,
     utterances: &[TimelineUtterance<'_>],
     gaps: &[Gap],
+    timeout: Duration,
     mut complete: F,
 ) -> Result<Draft, String>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<String, String>>,
 {
+    let deadline = tokio::time::Instant::now() + timeout;
     let seconds = |time: f64| (time * 100.0).round() / 100.0;
     let mut input = json!({
         "brief": brief,
@@ -217,16 +233,41 @@ where
         )).collect::<Vec<_>>(),
         "details": [],
         "repeatHints": repeat_hints(utterances),
+        "nearbyRetakeHints": nearby_retake_hints(utterances),
+        "joinAlternatives": super::joins::alternatives(utterances),
     });
+    // Reserve room for inspected words and repair feedback without dropping
+    // transcript coverage to make space for optional hypotheses.
+    while input.to_string().len() > INPUT_LIMIT * 2 / 3 {
+        if input["joinAlternatives"]
+            .as_array_mut()
+            .unwrap()
+            .pop()
+            .is_some()
+            || input["nearbyRetakeHints"]
+                .as_array_mut()
+                .unwrap()
+                .pop()
+                .is_some()
+            || input["repeatHints"].as_array_mut().unwrap().pop().is_some()
+        {
+            continue;
+        }
+        break;
+    }
     let mut correcting = false;
-    let mut audited = false;
+    let mut valid_draft: Option<Draft> = None;
     for call in 1..=MAX_CALLS {
         input["callsRemainingAfterThis"] = json!(MAX_CALLS - call);
         let payload = input.to_string();
         if payload.len() > INPUT_LIMIT {
-            return Err(INPUT_TOO_LARGE.into());
+            return audit_fallback(valid_draft, INPUT_TOO_LARGE);
         }
-        let reply = complete(payload).await?;
+        let reply = match tokio::time::timeout_at(deadline, complete(payload)).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => return audit_fallback(valid_draft, &error),
+            Err(_) => return audit_fallback(valid_draft, TIMEOUT),
+        };
         let trimmed = reply.trim();
         let json = trimmed
             .strip_prefix("```json")
@@ -243,27 +284,50 @@ where
                 correcting = true;
                 continue;
             }
-            Err(_) => return Err(INVALID_REPLY.into()),
+            Err(_) => return audit_fallback(valid_draft, INVALID_REPLY),
         };
         match step.action {
             Action::Inspect => {
                 if call == MAX_CALLS {
                     break;
                 }
-                if !step.summary.is_empty() || !step.pauses.is_empty() || !step.cuts.is_empty() {
-                    return Err(INVALID_REPLY.into());
+                if !step.summary.is_empty()
+                    || !step.pauses.is_empty()
+                    || !step.cuts.is_empty()
+                    || !step.joins.is_empty()
+                {
+                    return audit_fallback(valid_draft, INVALID_REPLY);
                 }
-                let window = inspect(step.window, utterances).ok_or(INVALID_REPLY)?;
+                let Some(window) = inspect(step.window, utterances) else {
+                    return audit_fallback(valid_draft, INVALID_REPLY);
+                };
                 input["details"].as_array_mut().unwrap().push(window);
             }
             Action::Propose if step.window.is_none() => {
-                match validate(step.clone(), utterances, gaps) {
-                    Ok(_) if !correcting && !audited && call < MAX_CALLS => {
+                let exposed: std::collections::HashSet<_> = input["joinAlternatives"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|option| option["id"].as_u64())
+                    .collect();
+                let validated = if step
+                    .joins
+                    .iter()
+                    .any(|choice| !exposed.contains(&(choice.id as u64)))
+                {
+                    Err(
+                        "Use only connection IDs exposed in joinAlternatives, or preserve the material.",
+                    )
+                } else {
+                    validate(step.clone(), utterances, gaps)
+                };
+                match validated {
+                    Ok(draft) if !correcting && valid_draft.is_none() && call < MAX_CALLS => {
                         input["draftForReview"] = json!(step);
                         input["reviewInstruction"] = json!(
-                            "Audit this draft against the entire transcript before finishing. Check the recording lead-in, count-ins, abandoned starts, repeated passages and repeatHints for missed edits. Verify the chosen kept take is the clearest complete version and preserves unique details. Verify each quiet gap was considered and preserve intentional waits and demonstrations. Hints are candidates, not proof of duplication. Return the complete corrected proposal, including any earlier cuts that remain valid; do not invent edits simply to change the draft."
+                            "Audit this draft against the entire transcript before finishing. Check the recording lead-in, count-ins, abandoned starts, repeated passages, repeatHints and joinAlternatives for missed edits. Verify the assembled fragments form the clearest complete wording and preserve unique details; a complete thought may span attempts. Verify each quiet gap was considered and preserve intentional waits and demonstrations. Hints are candidates, not proof of duplication. Return the complete corrected proposal, including any earlier cuts and joins that remain valid; do not invent edits simply to change the draft."
                         );
-                        audited = true;
+                        valid_draft = Some(draft);
                     }
                     Ok(draft) => return Ok(draft),
                     Err(issue) if !correcting && call < MAX_CALLS => {
@@ -271,13 +335,40 @@ where
                         input["draftForReview"] = json!(step);
                         correcting = true;
                     }
-                    Err(_) => return partial_draft(step, utterances, gaps),
+                    Err(issue) => {
+                        if valid_draft.is_some() {
+                            return audit_fallback(valid_draft, issue);
+                        }
+                        let mut step = step;
+                        let count = step.joins.len();
+                        step.joins
+                            .retain(|choice| exposed.contains(&(choice.id as u64)));
+                        let omitted = count != step.joins.len();
+                        let mut draft = partial_draft(step, utterances, gaps)?;
+                        if omitted {
+                            // The detailed validity checks below cover measured choices;
+                            // an unexposed ID must never become an implicit hypothesis.
+                            draft.notes.push("Some connection IDs were not present in the supplied evidence and were left unchanged.".into());
+                        }
+                        return Ok(draft);
+                    }
                 }
             }
-            _ => return Err(INVALID_REPLY.into()),
+            _ => return audit_fallback(valid_draft, INVALID_REPLY),
         }
     }
-    Err("The assistant reached its cleanup planning limit. Try a more specific brief.".into())
+    audit_fallback(
+        valid_draft,
+        "The assistant reached its cleanup planning limit. Try a more specific brief.",
+    )
+}
+
+fn audit_fallback(draft: Option<Draft>, reason: &str) -> Result<Draft, String> {
+    let mut draft = draft.ok_or_else(|| reason.to_owned())?;
+    draft.notes.push(format!(
+        "The follow-up cleanup review could not finish. {reason}"
+    ));
+    Ok(draft)
 }
 
 fn inspect(window: Option<UtteranceRange>, utterances: &[TimelineUtterance<'_>]) -> Option<Value> {
@@ -310,7 +401,8 @@ fn validate(
     gaps: &[Gap],
 ) -> Result<Draft, &'static str> {
     let summary = bounded(&step.summary, 1000);
-    if summary.is_empty() || step.pauses.len() + step.cuts.len() > MAX_PROPOSALS {
+    if summary.is_empty() || step.pauses.len() + step.cuts.len() + step.joins.len() > MAX_PROPOSALS
+    {
         return Err("Include a summary and at most 100 proposed removals.");
     }
 
@@ -361,6 +453,12 @@ fn validate(
         );
     }
     proposals.extend(cuts);
+    let joins = super::joins::select(&super::joins::alternatives(utterances), step.joins)
+        .ok_or("Choose valid join IDs, one alternative per group, with a reason.")?;
+    proposals.extend(joins);
+    if super::removes_all_speech(&proposals, utterances) {
+        return Err("Preserve the assembled speech; these cuts remove all spoken content.");
+    }
     if proposals.iter().enumerate().any(|(index, proposal)| {
         proposals[index + 1..]
             .iter()
@@ -381,7 +479,9 @@ fn partial_draft(
     utterances: &[TimelineUtterance<'_>],
     gaps: &[Gap],
 ) -> Result<Draft, String> {
-    if step.summary.trim().is_empty() || step.pauses.len() + step.cuts.len() > MAX_PROPOSALS {
+    if step.summary.trim().is_empty()
+        || step.pauses.len() + step.cuts.len() + step.joins.len() > MAX_PROPOSALS
+    {
         return Err(INVALID_DRAFT.into());
     }
     let mut candidates = Vec::new();
@@ -392,6 +492,7 @@ fn partial_draft(
         summary: step.summary.clone(),
         pauses: Vec::new(),
         cuts: Vec::new(),
+        joins: Vec::new(),
     };
     for choice in step.pauses {
         let id = choice.id;
@@ -421,6 +522,20 @@ fn partial_draft(
             Err(reason) => notes.push(format!(
                 "Transcript entries {first}–{last} were left unchanged. {reason}"
             )),
+        }
+    }
+    for choice in step.joins {
+        let id = choice.id;
+        match validate(
+            Step {
+                joins: vec![choice],
+                ..base.clone()
+            },
+            utterances,
+            gaps,
+        ) {
+            Ok(draft) => candidates.extend(draft.proposals),
+            Err(reason) => notes.push(format!("Connection {id} was left unchanged. {reason}")),
         }
     }
     let mut proposals = Vec::new();
@@ -510,6 +625,50 @@ pub(super) fn repeat_hints(utterances: &[TimelineUtterance<'_>]) -> Vec<Value> {
     hints
 }
 
+fn nearby_retake_hints(utterances: &[TimelineUtterance<'_>]) -> Vec<[usize; 2]> {
+    use std::collections::HashSet;
+
+    let keywords: Vec<HashSet<_>> = utterances
+        .iter()
+        .map(|line| {
+            words(line.text)
+                .filter(|word| {
+                    word.len() >= 4
+                        && !matches!(
+                            word.as_str(),
+                            "this"
+                                | "that"
+                                | "with"
+                                | "from"
+                                | "have"
+                                | "then"
+                                | "there"
+                                | "will"
+                                | "just"
+                                | "going"
+                                | "what"
+                                | "when"
+                                | "your"
+                        )
+                })
+                .collect()
+        })
+        .collect();
+    let mut hints = Vec::new();
+    for (first, earlier) in keywords.iter().enumerate() {
+        for (later, newer) in keywords.iter().enumerate().skip(first + 1).take(6) {
+            let shared = earlier.intersection(newer).count();
+            if shared >= 3 && 2 * shared > earlier.len().min(newer.len()) {
+                hints.push([first + 1, later + 1]);
+                if hints.len() == 48 {
+                    return hints;
+                }
+            }
+        }
+    }
+    hints
+}
+
 fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -573,6 +732,77 @@ mod tests {
             "action": "propose", "window": null,
             "summary": "Review these cuts.", "pauses": pauses, "cuts": cuts,
         })
+    }
+
+    #[tokio::test]
+    async fn keeps_valid_pause_and_retake_when_follow_up_review_fails() {
+        let lines = lines();
+        let gaps = transcript_gaps([(0, Range::new(1.2, 1.9))], &lines);
+        let mut retake = cut(3, 3);
+        retake["kind"] = json!("retake");
+        retake["keep"] = json!({"first": 2, "last": 2});
+        let mut replies = [
+            Ok(proposal(json!([{"id":1,"reason":"Unwanted pause"}]), json!([retake])).to_string()),
+            Err("The AI provider timed out.".into()),
+        ]
+        .into_iter();
+        let draft = plan(
+            "Clean up",
+            &lines,
+            &gaps,
+            &CancellationToken::new(),
+            PLANNING_TIMEOUT,
+            |_| ready(replies.next().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            draft
+                .proposals
+                .iter()
+                .map(|proposal| proposal.kind)
+                .collect::<Vec<_>>(),
+            ["pause", "retake"]
+        );
+        assert!(draft.notes[0].contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn keeps_a_valid_pause_when_the_follow_up_runs_past_the_deadline() {
+        let lines = lines();
+        let gaps = transcript_gaps([(0, Range::new(1.2, 1.9))], &lines);
+        let mut first = Some(proposal(
+            json!([{"id":1,"reason":"Unwanted pause"}]),
+            json!([]),
+        ));
+        let draft = plan(
+            "Clean up",
+            &lines,
+            &gaps,
+            &CancellationToken::new(),
+            Duration::from_millis(20),
+            |_| {
+                let reply = first.take();
+                async move {
+                    match reply {
+                        Some(reply) => Ok(reply.to_string()),
+                        None => pending().await,
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(draft.proposals.len(), 1);
+        assert!(draft.notes[0].contains(TIMEOUT));
+    }
+
+    #[test]
+    fn surfaces_reworded_nearby_takes_without_a_shared_prefix() {
+        let mut lines = lines();
+        lines[0].text = "Let's select the output format and export the video.";
+        lines[2].text = "Choose MP4 as the video output format before you export.";
+        assert!(nearby_retake_hints(&lines).contains(&[1, 3]));
     }
 
     #[tokio::test]
@@ -812,6 +1042,70 @@ mod tests {
         assert!(hints.contains(
             &json!({"earlier": {"first": 1, "last": 2}, "later": {"first": 3, "last": 3}})
         ));
+    }
+
+    #[tokio::test]
+    async fn optional_join_hypotheses_yield_to_transcript_coverage_and_inspection_budget() {
+        let text = "setting ".repeat(100);
+        let lines: Vec<_> = (0..64)
+            .map(|ordinal| {
+                let start = ordinal as f64 * 60.0 + 0.2;
+                TimelineUtterance {
+                    run: 0,
+                    ordinal,
+                    last: ordinal == 63,
+                    speech: Range::new(start, start + 49.9),
+                    cut_start: Some(start - 0.1),
+                    cut_end: Some(start + 50.0),
+                    text: &text,
+                    words: (0..100)
+                        .map(|index| crate::cleanup::audio::Word {
+                            text: "setting".into(),
+                            speech: Range::new(
+                                start + index as f64 * 0.5,
+                                start + index as f64 * 0.5 + 0.4,
+                            ),
+                            anchor: None,
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        let draft = plan(
+            "Preserve all unique information",
+            &lines,
+            &[],
+            &CancellationToken::new(),
+            PLANNING_TIMEOUT,
+            |payload| {
+                assert!(payload.len() < INPUT_LIMIT);
+                let input: Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(input["transcript"].as_array().unwrap().len(), 64);
+                assert!(input["joinAlternatives"].as_array().unwrap().len() < 48);
+                ready(Ok(proposal(json!([]), json!([])).to_string()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(draft.proposals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn never_accepts_a_connection_id_absent_from_the_evidence() {
+        let mut reply = proposal(json!([]), json!([]));
+        reply["joins"] = json!([{"id":999,"reason":"An unsupported connection"}]);
+        let draft = plan(
+            "Connect the fragments",
+            &lines(),
+            &[],
+            &CancellationToken::new(),
+            PLANNING_TIMEOUT,
+            |_| ready(Ok(reply.to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(draft.proposals.is_empty());
+        assert!(draft.notes.iter().any(|note| note.contains("not present")));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 mod chunks;
 pub(super) mod draft;
+mod joins;
 mod selections;
 
 use std::{collections::HashSet, path::Path};
@@ -527,12 +528,18 @@ fn removes_all_speech(proposals: &[Proposal], utterances: &[TimelineUtterance<'_
         })
 }
 
-fn conflicts(left: &Proposal, right: &Proposal) -> bool {
-    left.remove.overlaps(right.remove)
-        // Measured pause removals contain no speech. They can tighten the gaps
-        // between utterances of a retained take without deleting that take.
-        || (right.kind != "pause" && left.keep.is_some_and(|keep| keep.overlaps(right.remove)))
-        || (left.kind != "pause" && right.keep.is_some_and(|keep| keep.overlaps(left.remove)))
+pub(super) fn conflicts(left: &Proposal, right: &Proposal) -> bool {
+    match (left.kind == "pause", right.kind == "pause") {
+        (true, true) => left.remove.overlaps(right.remove),
+        // A measured pause can overlap the padding of a speech cut or fall inside
+        // either take. It stays independently usable if the speech cut is rejected.
+        (true, false) | (false, true) => false,
+        (false, false) => {
+            left.remove.overlaps(right.remove)
+                || left.keep.is_some_and(|keep| keep.overlaps(right.remove))
+                || right.keep.is_some_and(|keep| keep.overlaps(left.remove))
+        }
+    }
 }
 
 #[cfg(test)]
