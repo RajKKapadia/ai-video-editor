@@ -2,6 +2,7 @@ pub(crate) mod assistant;
 mod audio;
 mod cache;
 mod models;
+mod motion;
 mod pipeline;
 pub(crate) mod providers;
 #[cfg(test)]
@@ -755,24 +756,40 @@ async fn proposals(
     if failed_sources != 0 {
         report.review_notes.push("Analysis is incomplete. Unavailable sources were left unchanged; restore their media and analyze again to finish cleanup.".into());
     }
-    let candidates: Vec<_> = session
+    let measured: Vec<_> = session
         .runs
         .iter()
         .zip(&results)
         .enumerate()
         .flat_map(|(index, (run, result))| {
-            result
-                .iter()
-                .flat_map(|result| &result.pauses)
-                .map(move |range| (index, range.offset(run.timeline_start)))
+            result.iter().flat_map(move |result| {
+                result.pauses.iter().enumerate().map(move |(gap, range)| {
+                    (
+                        index,
+                        range.offset(run.timeline_start),
+                        result.motion.get(gap).copied().flatten(),
+                    )
+                })
+            })
         })
+        .collect();
+    let labels = motion::label(
+        &measured
+            .iter()
+            .map(|(_, _, score)| *score)
+            .collect::<Vec<_>>(),
+    );
+    let candidates: Vec<Candidate> = measured
+        .into_iter()
+        .zip(labels)
+        .map(|((run, range, _), motion)| Candidate { run, range, motion })
         .collect();
     let duration = session
         .runs
         .last()
         .map_or(0.0, |run| run.timeline_start + run.source.duration());
     let mut quiet_coverage = 0.0_f64;
-    for (_, range) in &candidates {
+    for Candidate { range, .. } in &candidates {
         if range.start <= quiet_coverage + 0.000_001 {
             quiet_coverage = quiet_coverage.max(range.end);
         }
@@ -782,13 +799,14 @@ async fn proposals(
     if session.assistant.is_none() {
         report
             .proposals
-            .extend(candidates.iter().map(|(_, range)| Proposal {
+            .extend(candidates.iter().map(|candidate| Proposal {
                 kind: "pause",
-                remove: *range,
+                remove: candidate.range,
                 keep: None,
                 removed_text: None,
                 kept_text: None,
-                reason: None,
+                reason:
+                    (candidate.motion == motion::Motion::Active).then(|| ACTIVE_PAUSE_NOTE.into()),
             }));
     }
     session.control.check()?;
@@ -852,7 +870,7 @@ async fn proposals(
             .filter(|transcript| !transcript.utterances.is_empty())
             .ok_or("No speech was transcribed from the current timeline.")?;
         let connection = connection.ok_or("The assistant’s AI provider is unavailable.")?;
-        let gaps = assistant::transcript_gaps(candidates.iter().copied(), &utterances);
+        let gaps = assistant::measured_gaps(candidates.iter().copied(), &utterances);
         progress(app, &session.id, stage.progress(), None);
         if drafting {
             let draft = assistant::draft::run(
@@ -926,19 +944,31 @@ async fn proposals(
     Ok(report)
 }
 
-fn local_pause_review(report: &mut Report, candidates: &[(usize, Range)]) {
+/// A measured pause that the planner can review, with picture activity.
+#[derive(Clone, Copy)]
+struct Candidate {
+    run: usize,
+    range: Range,
+    motion: motion::Motion,
+}
+
+const ACTIVE_PAUSE_NOTE: &str = "The picture changes during this pause, which may be a demonstration. Watch it before applying.";
+
+fn local_pause_review(report: &mut Report, candidates: &[Candidate]) {
     report.proposals = candidates
         .iter()
-        .map(|(_, range)| Proposal {
+        .map(|candidate| Proposal {
             kind: "pause",
-            remove: *range,
+            remove: candidate.range,
             keep: None,
             removed_text: None,
             kept_text: None,
-            reason: Some(
+            reason: Some(if candidate.motion == motion::Motion::Active {
+                ACTIVE_PAUSE_NOTE.into()
+            } else {
                 "Measured quiet audio. Review whether this is an intentional wait before applying."
-                    .into(),
-            ),
+                    .into()
+            }),
         })
         .collect();
     report.draft_summary = Some(if report.can_clear_timeline {

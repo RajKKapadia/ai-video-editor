@@ -191,6 +191,7 @@ mod tests {
                     anchor: None,
                 }],
             }],
+            motion: Vec::new(),
         }
     }
     #[test]

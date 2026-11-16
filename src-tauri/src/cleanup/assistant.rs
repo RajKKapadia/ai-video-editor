@@ -2,6 +2,7 @@ mod chunks;
 pub(super) mod draft;
 pub(crate) mod planning;
 mod selections;
+mod takes;
 
 use std::{collections::HashSet, path::Path};
 
@@ -13,7 +14,9 @@ use tauri::AppHandle;
 use crate::project_cache::with_project_cache;
 
 use super::{
-    CachedUtterance, Proposal, ProviderSelection, Range, Session, TimelineUtterance, join_text,
+    CachedUtterance, Candidate, Proposal, ProviderSelection, Range, Session, TimelineUtterance,
+    join_text,
+    motion::Motion,
     providers::{Connection, Task, UtteranceRange, utterance_range_schema},
     resolve, safe_removal_range,
 };
@@ -159,8 +162,27 @@ pub(crate) async fn assistant_history(
 #[serde(deny_unknown_fields)]
 struct PauseChoice {
     id: usize,
+    #[serde(default)]
+    action: PauseAction,
     reason: String,
 }
+
+/// What to do with a measured quiet gap. Keeping a gap means leaving it out
+/// of the proposal entirely.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PauseAction {
+    /// Tighten to the measured breathing room beside speech (about 0.3 s).
+    #[default]
+    Remove,
+    /// Leave a deliberate beat of about 0.7 s, e.g. after a point or a question.
+    Shorten,
+}
+
+/// Extra silence a shortened gap keeps beyond the normal speech padding.
+const SHORTEN_BEAT: f64 = 0.4;
+/// A shortened removal smaller than this is not worth an edit.
+const MIN_SHORTENED_REMOVAL: f64 = 0.25;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -189,14 +211,30 @@ pub(super) struct Gap {
     before: usize,
     after: usize,
     range: Range,
+    motion: Motion,
 }
 
+#[cfg(test)]
 pub(super) fn transcript_gaps(
     candidates: impl IntoIterator<Item = (usize, Range)>,
     utterances: &[TimelineUtterance<'_>],
 ) -> Vec<Gap> {
+    measured_gaps(
+        candidates.into_iter().map(|(run, range)| Candidate {
+            run,
+            range,
+            motion: Motion::Unknown,
+        }),
+        utterances,
+    )
+}
+
+pub(super) fn measured_gaps(
+    candidates: impl IntoIterator<Item = Candidate>,
+    utterances: &[TimelineUtterance<'_>],
+) -> Vec<Gap> {
     let mut gaps = Vec::new();
-    for (run, range) in candidates {
+    for Candidate { run, range, motion } in candidates {
         let after = utterances.partition_point(|line| line.speech.start < range.end);
         let left = after.checked_sub(1).and_then(|index| utterances.get(index));
         let right = utterances.get(after);
@@ -226,6 +264,7 @@ pub(super) fn transcript_gaps(
                 before: left.map_or(0, |_| after),
                 after: right.map_or(0, |_| after + 1),
                 range,
+                motion,
             });
         }
     }
@@ -271,8 +310,12 @@ fn task_schema() -> serde_json::Value {
         "properties": {
             "summary": {"type": "string"},
             "pauses": {"type": "array", "items": {
-                "type": "object", "properties": {"id": {"type": "integer"}, "reason": reason},
-                "required": ["id", "reason"], "additionalProperties": false
+                "type": "object", "properties": {
+                    "id": {"type": "integer"},
+                    "action": {"enum": ["remove", "shorten"], "type": "string"},
+                    "reason": reason
+                },
+                "required": ["id", "action", "reason"], "additionalProperties": false
             }},
             "cuts": {"type": "array", "items": {
                 "type": "object", "properties": {
@@ -395,7 +438,7 @@ pub(super) async fn review(
             _ => 0,
         };
         let proposals = match stage {
-            Stage::Pauses => pause_proposals(gaps, reply.pauses),
+            Stage::Pauses => pause_proposals(gaps, reply.pauses).0,
             Stage::Cuts => cut_proposals(utterances, reply.cuts),
             Stage::Chat | Stage::Draft => Vec::new(),
         };
@@ -441,23 +484,70 @@ fn bounded(text: &str, characters: usize) -> String {
     text.trim().chars().take(characters).collect()
 }
 
-fn pause_proposals(gaps: &[Gap], choices: Vec<PauseChoice>) -> Vec<Proposal> {
+/// Measured removal range for a pause decision, or `None` when a shortened
+/// gap is already close to the requested beat and should be kept as it is.
+fn pause_removal(gap: &Gap, action: PauseAction) -> Option<Range> {
+    let range = gap.range;
+    let range = match action {
+        PauseAction::Remove => return Some(range),
+        // Recording edges keep their beat beside the speech.
+        PauseAction::Shorten if gap.before == 0 && gap.after != 0 => {
+            Range::new(range.start, range.end - SHORTEN_BEAT)
+        }
+        PauseAction::Shorten if gap.after == 0 && gap.before != 0 => {
+            Range::new(range.start + SHORTEN_BEAT, range.end)
+        }
+        PauseAction::Shorten => Range::new(
+            range.start + SHORTEN_BEAT * 0.5,
+            range.end - SHORTEN_BEAT * 0.5,
+        ),
+    };
+    (range.duration() + 0.000_001 >= MIN_SHORTENED_REMOVAL).then_some(range)
+}
+
+/// Returns the proposals and the number of valid choices that were kept
+/// because a shortened gap would barely change.
+fn pause_proposals(gaps: &[Gap], choices: Vec<PauseChoice>) -> (Vec<Proposal>, usize) {
     let mut seen = HashSet::new();
-    choices
+    let mut unchanged = 0;
+    let proposals = choices
         .into_iter()
         .filter_map(|choice| {
             let gap = gaps.get(choice.id.checked_sub(1)?)?;
             let reason = bounded(&choice.reason, 350);
-            (seen.insert(choice.id) && !reason.is_empty()).then_some(Proposal {
+            if !seen.insert(choice.id) || reason.is_empty() {
+                return None;
+            }
+            // The picture changes during this gap while it is usually still or
+            // steady: probably a demonstration. Never remove it entirely.
+            let (action, reason) =
+                if choice.action == PauseAction::Remove && gap.motion == Motion::Active {
+                    (
+                        PauseAction::Shorten,
+                        format!("Shortened rather than removed because the picture changes during this pause. {reason}"),
+                    )
+                } else {
+                    (choice.action, reason)
+                };
+            let Some(remove) = pause_removal(gap, action) else {
+                unchanged += 1;
+                return None;
+            };
+            Some(Proposal {
                 kind: "pause",
-                remove: gap.range,
+                remove,
                 keep: None,
                 removed_text: None,
                 kept_text: None,
-                reason: Some(reason),
+                reason: Some(if action == PauseAction::Shorten {
+                    format!("Leaves a short beat. {reason}")
+                } else {
+                    reason
+                }),
             })
         })
-        .collect()
+        .collect();
+    (proposals, unchanged)
 }
 
 fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) -> Vec<Proposal> {
@@ -585,12 +675,80 @@ mod tests {
         let choices = [0, 1, 1, 9]
             .map(|id| PauseChoice {
                 id,
+                action: PauseAction::Remove,
                 reason: "Reason".into(),
             })
             .into();
-        let proposals = pause_proposals(&gaps, choices);
-        assert_eq!(proposals.len(), 1);
+        let (proposals, unchanged) = pause_proposals(&gaps, choices);
+        assert_eq!((proposals.len(), unchanged), (1, 0));
         assert_eq!(proposals[0].remove, gap);
+    }
+
+    #[test]
+    fn pauses_can_be_shortened_and_active_pictures_are_never_removed() {
+        let mut first = line(0, 0, 0.5, 1.0);
+        let second = line(0, 1, 3.0, 4.0);
+        let mut third = line(0, 2, 4.8, 5.4);
+        first.last = false;
+        third.last = true;
+        let lines = [first, second, third];
+        let gaps = measured_gaps(
+            [
+                Candidate {
+                    run: 0,
+                    range: Range::new(0.0, 0.35),
+                    motion: Motion::Still,
+                },
+                Candidate {
+                    run: 0,
+                    range: Range::new(1.15, 2.85),
+                    motion: Motion::Still,
+                },
+                Candidate {
+                    run: 0,
+                    range: Range::new(4.15, 4.65),
+                    motion: Motion::Still,
+                },
+                Candidate {
+                    run: 0,
+                    range: Range::new(5.55, 9.0),
+                    motion: Motion::Active,
+                },
+            ],
+            &lines,
+        );
+        assert_eq!(gaps.len(), 4);
+        let choice = |id, action| PauseChoice {
+            id,
+            action,
+            reason: "Reason".into(),
+        };
+        let (proposals, unchanged) = pause_proposals(
+            &gaps,
+            vec![
+                choice(1, PauseAction::Shorten),
+                choice(2, PauseAction::Shorten),
+                choice(3, PauseAction::Shorten),
+                choice(4, PauseAction::Remove),
+            ],
+        );
+        // Gaps 1 and 3 are already close to a beat and stay as they are.
+        assert_eq!(unchanged, 2);
+        assert_eq!(proposals.len(), 2);
+        let close = |range: Range, start: f64, end: f64| {
+            (range.start - start).abs() < 1e-9 && (range.end - end).abs() < 1e-9
+        };
+        assert!(close(proposals[0].remove, 1.35, 2.65));
+        // The recording tail keeps its beat beside the speech, and an active
+        // picture is shortened even though the model asked to remove it.
+        assert!(close(proposals[1].remove, 5.95, 9.0));
+        assert!(
+            proposals[1]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("picture changes")
+        );
     }
 
     #[test]

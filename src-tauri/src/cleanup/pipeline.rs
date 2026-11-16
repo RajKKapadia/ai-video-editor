@@ -16,7 +16,7 @@ use super::{
     LOCAL_TRANSCRIPT_TOO_LARGE as TRANSCRIPT_TOO_LARGE, MediaInput, Session,
     audio::{Engine, PreparedAudio},
     cache::{Cache, Transcript, linked_key},
-    progress, speech, transcript_store, transcription_api,
+    motion, progress, speech, transcript_store, transcription_api,
     worker::Transcriber,
 };
 
@@ -129,7 +129,7 @@ struct MediaRevision {
 
 fn decode(
     mut sources: mpsc::Receiver<Source>,
-    ready: SyncSender<(usize, PreparedRange)>,
+    ready: SyncSender<(usize, PreparedRange, Vec<Option<f64>>)>,
     vad: &Path,
     progress: &PipelineProgress<'_>,
     transcribing: &AtomicBool,
@@ -199,11 +199,31 @@ fn decode(
                 }
             };
             session.control.check()?;
+            // Measure the picture during each pause while the source is still
+            // available; uploaded media is released after this loop.
+            let pauses = match &audio {
+                _ if !session.pauses => Vec::new(),
+                PreparedRange::Cached(analysis, ..) => analysis.pauses.clone(),
+                PreparedRange::Decoded(Some(prepared), _) => prepared.detected.pauses(),
+                _ => Vec::new(),
+            };
+            let motion = pauses
+                .iter()
+                .map(|gap| {
+                    motion::measure(
+                        &session.decoder,
+                        input.path(),
+                        gap.offset(range.start),
+                        &session.control,
+                    )
+                })
+                .collect();
+            session.control.check()?;
             progress.update(|state| {
                 state.preparing = 0.0;
                 state.prepared += 1;
             });
-            if ready.send((index, audio)).is_err() {
+            if ready.send((index, audio, motion)).is_err() {
                 return session.control.check();
             }
         }
@@ -217,7 +237,7 @@ fn decode(
 }
 
 fn collect(
-    prepared: Receiver<(usize, PreparedRange)>,
+    prepared: Receiver<(usize, PreparedRange, Vec<Option<f64>>)>,
     transcriber: &mut Option<Transcriber<'_>>,
     remote: Option<&transcription_api::Transcriber>,
     selection: Option<&speech::Selection>,
@@ -242,7 +262,7 @@ fn collect(
             .and_then(|selection| selection.device.as_ref())
             .map_or("CPU", |device| device.name.as_str())
     };
-    for (index, audio) in prepared {
+    for (index, audio, motion) in prepared {
         session.control.check()?;
         let run = &session.runs[index];
         let cached = matches!(audio, PreparedRange::Cached(..));
@@ -254,8 +274,9 @@ fn collect(
         };
         let result = match audio {
             PreparedRange::Repeated(first, _) => results[first].clone(),
-            PreparedRange::Cached(analysis, device, _) => {
+            PreparedRange::Cached(mut analysis, device, _) => {
                 devices.extend(device);
+                analysis.motion = motion;
                 Some(Arc::new(analysis))
             }
             PreparedRange::Decoded(None, _) => {
@@ -267,6 +288,7 @@ fn collect(
                 let mut transcript = None;
                 if session.pauses {
                     result.pauses = audio.detected.pauses();
+                    result.motion = motion;
                 }
                 if let (Some(pcm), Some(model)) = (audio.pcm, model)
                     && transcribing.load(Ordering::Relaxed)

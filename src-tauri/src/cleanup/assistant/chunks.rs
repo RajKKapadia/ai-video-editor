@@ -20,6 +20,7 @@ pub(super) fn windows(
     lines: &[TimelineUtterance<'_>],
     gaps: &[Gap],
     budget: Budget,
+    retakes: bool,
 ) -> Vec<Window<usize>> {
     let mut result = Vec::new();
     let mut start = 0;
@@ -37,6 +38,7 @@ pub(super) fn windows(
                 &lines[window.clone()],
                 &context_gaps(gaps, &window, lines.len()),
                 budget,
+                retakes,
             ) {
                 end = mid;
                 low = mid + 1;
@@ -75,6 +77,7 @@ fn context_gaps(gaps: &[Gap], window: &Window<usize>, total: usize) -> Vec<Gap> 
             } else {
                 gap.after - window.start
             },
+            motion: gap.motion,
         })
         .collect()
 }
@@ -88,7 +91,7 @@ pub(super) async fn run(
     compare_retakes: bool,
 ) -> Result<Draft, String> {
     let budget = connection.budget();
-    let full = draft::fits(brief, lines, gaps, budget);
+    let full = draft::fits(brief, lines, gaps, budget, compare_retakes);
     {
         let mut diagnostics = connection.planning.lock().unwrap();
         diagnostics.strategy = if full { "fullTimeline" } else { "sections" }.into();
@@ -105,10 +108,28 @@ pub(super) async fn run(
         compare_retakes,
         budget,
         |scope, direction, local, local_gaps| async move {
-            draft::run_window(connection, &direction, &local, &local_gaps, cancel, scope).await
+            draft::run_window(
+                connection,
+                &direction,
+                &local,
+                &local_gaps,
+                cancel,
+                scope,
+                compare_retakes,
+            )
+            .await
         },
     )
     .await;
+    // Check the combined result, across sections, for a single take of each line.
+    let result = result.map(|mut draft| {
+        if compare_retakes {
+            draft
+                .notes
+                .extend(draft::single_take_notes(lines, &draft.proposals));
+        }
+        draft
+    });
     let mut diagnostics = connection.planning.lock().unwrap();
     diagnostics.total_utterances = lines.len();
     diagnostics.reviewed_utterances = lines
@@ -166,7 +187,7 @@ where
     if cancel.is_cancelled() {
         return Err("Timeline analysis cancelled.".into());
     }
-    if draft::fits(brief, lines, gaps, budget) {
+    if draft::fits(brief, lines, gaps, budget, compare_retakes) {
         match complete("fullTimeline", brief.into(), lines.to_vec(), gaps.to_vec()).await {
             Ok(draft) => {
                 cancel_check(cancel)?;
@@ -186,7 +207,7 @@ where
     } else {
         budget
     };
-    let mut windows = windows(&direction, lines, gaps, section_budget);
+    let mut windows = windows(&direction, lines, gaps, section_budget, compare_retakes);
     if windows.len() == 1 && fallback.is_some() {
         windows = split_window(0..lines.len());
     }
@@ -580,7 +601,7 @@ mod tests {
                 words: Vec::new(),
             })
             .collect();
-        let windows = windows("Brief", &lines, &[], Budget::default());
+        let windows = windows("Brief", &lines, &[], Budget::default(), true);
         assert!(windows.len() > 1);
         assert_eq!(windows[0].start, 0);
         assert_eq!(windows.last().unwrap().end, lines.len());
