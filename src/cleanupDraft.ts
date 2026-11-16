@@ -34,7 +34,7 @@ function validReport(value: unknown): value is CleanupReport {
   const report = value as CleanupReport;
   const optionalText = (text: unknown) => text == null || typeof text === 'string';
   return Array.isArray(report.proposals) && report.proposals.every((proposal) => proposal &&
-    ['pause', 'retake', 'cut'].includes(proposal.kind) && validRange(proposal.remove) &&
+    ['pause', 'retake', 'cut', 'splice'].includes(proposal.kind) && validRange(proposal.remove) &&
     (proposal.keep == null || validRange(proposal.keep)) && optionalText(proposal.reason) &&
     optionalText(proposal.removedText) && optionalText(proposal.keptText)) &&
     optionalText(report.retakeIssue) && optionalText(report.transcriptCacheIssue) &&
@@ -43,6 +43,10 @@ function validReport(value: unknown): value is CleanupReport {
       (report.speech.device == null || typeof report.speech.device.name === 'string'))) &&
     (report.reviewNotes === undefined || (Array.isArray(report.reviewNotes) && report.reviewNotes.every((note) => typeof note === 'string'))) &&
     (report.canClearTimeline === undefined || typeof report.canClearTimeline === 'boolean') &&
+    (report.verification === undefined || (!!report.verification &&
+      ['checked', 'partial'].includes(report.verification.status) &&
+      [report.verification.checkedPreviews, report.verification.rejectedEdits, report.verification.unresolvedEdits]
+        .every((value) => Number.isInteger(value) && value >= 0))) &&
     Number.isInteger(report.failedSources) && report.failedSources >= 0 && validPlanning(report.planning);
 }
 
@@ -95,8 +99,10 @@ export function remainingCleanupReview(
     return [{ ...proposal, remove, keep }];
   });
   if (!proposals.length) return null;
+  const { verification: previousVerification, ...previousReport } = review.report;
   const report = prepareCleanupReview(edit.timeline, {
-    ...review.report, proposals,
+    ...previousReport, proposals,
+    ...(previousVerification && { reviewNotes: [...previousReport.reviewNotes ?? [], 'These remaining suggestions were checked against the earlier timeline. Preview the new joins before applying, or run cleanup again to repeat the audio checks.'] }),
     ...(review.report.draftSummary && { draftSummary: 'Remaining suggestions from your cleanup draft. Review and apply the cuts you choose.' }),
   });
   return report.proposals.length ? { ...review, snapshot: edit.timeline, report } : null;
