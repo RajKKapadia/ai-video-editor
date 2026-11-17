@@ -2,6 +2,7 @@ mod chunks;
 pub(super) mod draft;
 mod joins;
 pub(crate) mod planning;
+mod restarts;
 mod selections;
 mod takes;
 
@@ -481,6 +482,24 @@ pub(super) async fn review(
     Ok((proposals, messages, notes))
 }
 
+/// Clear, verbatim restarts measured without a provider, for local fallback.
+pub(super) fn measured_restarts(utterances: &[TimelineUtterance<'_>]) -> Vec<Proposal> {
+    restarts::clear_proposals(utterances)
+}
+
+#[cfg(test)]
+pub(super) fn restart_evidence(utterances: &[TimelineUtterance<'_>]) -> Vec<serde_json::Value> {
+    restarts::evidence(utterances)
+}
+
+pub(super) fn conflicts_with(left: &Proposal, right: &Proposal) -> bool {
+    conflicts(left, right)
+}
+
+pub(super) fn bridge_removals(proposals: &mut [Proposal], utterances: &[TimelineUtterance<'_>]) {
+    bridge(proposals, utterances)
+}
+
 fn bounded(text: &str, characters: usize) -> String {
     text.trim().chars().take(characters).collect()
 }
@@ -554,7 +573,7 @@ fn pause_proposals(gaps: &[Gap], choices: Vec<PauseChoice>) -> (Vec<Proposal>, u
 
 fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) -> Vec<Proposal> {
     let mut seen = HashSet::new();
-    let candidates: Vec<_> = choices
+    let mut candidates: Vec<_> = choices
         .into_iter()
         .filter_map(|choice| {
             let range = choice.remove;
@@ -587,6 +606,7 @@ fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) 
             })
         })
         .collect();
+    bridge(&mut candidates, utterances);
     let approved: Vec<_> = candidates
         .iter()
         .enumerate()
@@ -603,6 +623,45 @@ fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) 
         return Vec::new();
     }
     proposals
+}
+
+/// Shortest retained audio allowed between two separate removals.
+const MIN_FRAGMENT: f64 = 0.15;
+
+/// Join removals separated by a sliver shorter than `MIN_FRAGMENT` when the
+/// sliver holds no speech and no kept take, by extending the earlier removal
+/// to the later one. Removal boundaries from different sources rarely line up
+/// exactly: a quiet clip tail ending 20 ms before the next clip's count-in
+/// would otherwise strand a flash frame, and both edits used to be rejected.
+/// Slivers containing speech stay a conflict so audible fragments are never cut.
+fn bridge(proposals: &mut [Proposal], utterances: &[TimelineUtterance<'_>]) {
+    let mut order: Vec<usize> = (0..proposals.len()).collect();
+    order.sort_by(|&left, &right| {
+        proposals[left]
+            .remove
+            .start
+            .total_cmp(&proposals[right].remove.start)
+    });
+    for pair in order.windows(2) {
+        let (earlier, later) = (pair[0], pair[1]);
+        let gap = Range::new(proposals[earlier].remove.end, proposals[later].remove.start);
+        let silent = !utterances.iter().any(|line| {
+            if line.words.is_empty() {
+                line.speech.overlaps(gap)
+            } else {
+                line.words.iter().any(|word| word.speech.overlaps(gap))
+            }
+        });
+        if gap.duration() > 0.000_001
+            && gap.duration() < MIN_FRAGMENT - 0.000_001
+            && silent
+            && !proposals
+                .iter()
+                .any(|proposal| proposal.keep.is_some_and(|keep| keep.overlaps(gap)))
+        {
+            proposals[earlier].remove.end = gap.end;
+        }
+    }
 }
 
 fn removes_all_speech(proposals: &[Proposal], utterances: &[TimelineUtterance<'_>]) -> bool {
@@ -632,7 +691,7 @@ pub(super) fn conflicts(left: &Proposal, right: &Proposal) -> bool {
             let gap = if left.remove.end <= right.remove.start {
                 right.remove.start - left.remove.end
             } else { left.remove.start - right.remove.end };
-            gap > 0.000_001 && gap < 0.15 - 0.000_001
+            gap > 0.000_001 && gap < MIN_FRAGMENT - 0.000_001
         }
         // Measured pause removals contain no speech. They can tighten the gaps
         // between utterances of a retained take without deleting that take.
@@ -804,6 +863,39 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_silent_sliver_at_a_clip_join_is_bridged_but_speech_is_not() {
+        // A clip's quiet tail ends 20 ms before the next clip's count-in cut.
+        let count_in = line(1, 0, 3.0, 4.0);
+        let pause = Proposal {
+            watch: false,
+            kind: "pause",
+            remove: Range::new(1.5, 2.88),
+            keep: None,
+            removed_text: None,
+            kept_text: None,
+            reason: Some("Quiet tail".into()),
+        };
+        let chatter = Proposal {
+            kind: "cut",
+            remove: Range::new(2.9, 4.1),
+            ..pause.clone()
+        };
+        assert!(conflicts(&pause, &chatter));
+        let mut joined = vec![pause.clone(), chatter.clone()];
+        bridge(&mut joined, std::slice::from_ref(&count_in));
+        assert_eq!(joined[0].remove, Range::new(1.5, 2.9));
+        assert!(!conflicts(&joined[0], &joined[1]));
+
+        // A word inside the sliver is audible: keep the conflict.
+        let mut spoken = count_in.clone();
+        spoken.speech = Range::new(2.885, 4.0);
+        let mut kept = vec![pause, chatter];
+        bridge(&mut kept, &[spoken]);
+        assert_eq!(kept[0].remove, Range::new(1.5, 2.88));
+        assert!(conflicts(&kept[0], &kept[1]));
     }
 
     #[test]

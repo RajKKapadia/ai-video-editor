@@ -26,7 +26,7 @@ export type AssistantStage = 'draft' | 'pauses' | 'cuts' | 'chat' | 'instruct';
 export type AssistantRequest = { stage: AssistantStage; message: string; provider: ProviderSelection };
 export type CleanupOptions = { pauses: boolean; retakes: ProviderSelection | null; assistant?: AssistantRequest };
 
-export const adaptiveCleanupBrief = 'Build a flowing sequence using cuts and joins. Remove clear false starts, accidental repeated words or passages, recording count-ins, and dispensable quiet gaps. Connect partial attempts to their continuations, keeping overlapping words only once. Preserve unique details, necessary connecting words, intentional repetition, natural local rhythm, intentional pauses, and time used for demonstrations.';
+export const adaptiveCleanupBrief = 'Build a flowing sequence using cuts and joins. Remove clear false starts, restarts, accidental repeated words or passages, recording count-ins, and dispensable quiet gaps, so the result plays as a single take. Connect partial attempts to their continuations, keeping overlapping words only once. Preserve unique details, necessary connecting words, intentional repetition, natural local rhythm, intentional pauses, and time used for demonstrations.';
 
 const chunkBytes = 1024 * 1024;
 

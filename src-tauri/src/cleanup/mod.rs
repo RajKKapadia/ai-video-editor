@@ -884,6 +884,9 @@ async fn proposals(
             && (report.retake_issue.is_some() || connection.is_none() || utterances.is_empty())
         {
             local_pause_review(&mut report, &candidates);
+            if drafting {
+                local_restart_review(&mut report, &utterances);
+            }
             return Ok(report);
         }
         let transcript = transcript
@@ -907,6 +910,7 @@ async fn proposals(
                 Err(error) => {
                     report.retake_issue = Some(error);
                     local_pause_review(&mut report, &candidates);
+                    local_restart_review(&mut report, &utterances);
                     return Ok(report);
                 }
             };
@@ -1088,6 +1092,51 @@ fn local_pause(candidate: &Candidate) -> Proposal {
             "Measured quiet audio. Review whether this is an intentional wait before applying."
                 .into()
         }),
+    }
+}
+
+/// Without a planner result, still offer verbatim restarts measured from the
+/// aligned words so the draft moves toward a single take.
+fn local_restart_review(report: &mut Report, utterances: &[TimelineUtterance<'_>]) {
+    let restarts = assistant::measured_restarts(utterances);
+    if restarts.is_empty() {
+        return;
+    }
+    // Quiet gaps inside a removed attempt are redundant with that removal.
+    let inside = |pause: &Proposal| {
+        restarts.iter().any(|restart| {
+            restart.remove.start <= pause.remove.start + 0.000_001
+                && restart.remove.end >= pause.remove.end - 0.000_001
+        })
+    };
+    report.proposals.retain(|pause| !inside(pause));
+    let count = restarts.len();
+    let mut added = 0;
+    for restart in restarts {
+        let mut trial = report.proposals.clone();
+        trial.push(restart);
+        assistant::bridge_removals(&mut trial, utterances);
+        let (candidate, others) = trial.split_last().unwrap();
+        if !others
+            .iter()
+            .any(|pause| assistant::conflicts_with(candidate, pause))
+        {
+            report.proposals = trial;
+            added += 1;
+        }
+    }
+    report
+        .proposals
+        .sort_by(|left, right| left.remove.start.total_cmp(&right.remove.start));
+    report.review_notes.push(format!(
+        "Added {added} measured restart{} where the same words were spoken again. Rephrased repeats and intentional repetition were not checked.",
+        if added == 1 { "" } else { "s" }
+    ));
+    if added < count {
+        report.review_notes.push(format!(
+            "{} measured restarts overlapped a quiet-gap edit and were left unchanged.",
+            count - added
+        ));
     }
 }
 
