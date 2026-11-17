@@ -18,7 +18,8 @@ use super::{
 };
 
 // Change the version when decoding, speech grouping, or boundary rules change.
-const VERSION: u32 = 1;
+// Version 2: quiet detection follows each source's measured noise floor.
+const VERSION: u32 = 2;
 const MAX_RANGES: usize = 1024;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const TIME_EPSILON: f64 = 0.000_001;

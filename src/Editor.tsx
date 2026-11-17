@@ -14,7 +14,7 @@ import { CleanupPanel } from './CleanupPanel';
 import { remainingCleanupReview, restoreCleanupDraft, type CleanupReview, type SavedCleanupDraft } from './cleanupDraft';
 import { ExportPanel } from './ExportPanel';
 import { Icon, type IconName } from './Icon';
-import { adaptiveCleanupBrief, analyzeTimeline, errorMessage, hasAnalyzableAudio, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
+import { adaptiveCleanupBrief, analyzeTimeline, errorMessage, hasAnalyzableAudio, instructTimeline, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
 import { canPreviewCleanupDraft, makeCleanupEdit, minSegmentDuration, prepareCleanupReview, type AssistantMessage, type TimeRange } from './cleanupTimeline';
 import { inspectMedia, storeMedia } from './cache';
 import { importConcurrency, mapConcurrent } from './resources';
@@ -121,6 +121,8 @@ export function Editor({
   const [prompt, setPrompt] = useState('');
   const [notice, setNotice] = useState('');
   const [importing, setImporting] = useState(false);
+  // Per-file progress (0–1) for the import in flight; null while idle.
+  const [importProgress, setImportProgress] = useState<number[] | null>(null);
   const [dropping, setDropping] = useState(false);
   const [selectedSegment, setSelectedSegment] = useState<string | null>(null);
   const [history, setHistory] = useState<{ before: Segment[]; after: Segment[]; cleanup: SavedCleanupDraft | null }[]>([]);
@@ -594,11 +596,13 @@ export function Editor({
     cleanupJob.current = job;
     if (stage !== 'chat' && snapshot === project.timeline) resetCleanupPreview();
     if (stage === 'cuts') setPendingCuts(snapshot);
-    if (stage === 'pauses' || stage === 'draft') setPendingCuts(null);
+    if (stage === 'pauses' || stage === 'draft' || stage === 'instruct') setPendingCuts(null);
     setCleanupError('');
     setCleanupProgress({ stage: stage ? 'Preparing the timeline assistant' : 'Preparing timeline cleanup', fraction: null });
     try {
-      const result = await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
+      const result = stage === 'instruct' && options.assistant
+        ? await instructTimeline(project.id, job.snapshot, clipById, options.assistant, job.controller.signal, setCleanupProgress)
+        : await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
       const report = prepareCleanupReview(job.snapshot, result);
       if (cleanupJob.current !== job || job.controller.signal.aborted) return;
       if (stage === 'draft' && !canPreviewCleanupDraft(snapshot, report)) {
@@ -662,6 +666,12 @@ export function Editor({
     if (!cleanupEdit || !currentReview || cleanupJob.current) return;
     const position = previewing ? sequenceTime : cleanupEdit.mapTime(sequenceTime);
     const remaining = nextAssistantStage ? null : remainingCleanupReview(currentReview, checkedCuts, cleanupEdit);
+    const appliedEdits = currentReview.report.proposals.flatMap((proposal, index) =>
+      checkedCuts.has(index) && proposal.editId !== undefined ? [proposal.editId] : []);
+    if (appliedEdits.length) {
+      // The edit log only informs later instructions; a failed write never blocks Apply.
+      void invoke('agent_edits_applied', { projectId: project.id, ids: appliedEdits }).catch(() => {});
+    }
     changeTimeline(cleanupEdit.timeline, currentReview.snapshot, remaining
       ? { version: 1, review: remaining, checked: [], pendingCuts: null } : undefined);
     setCleanupReview(remaining);
@@ -683,7 +693,7 @@ export function Editor({
     resetCleanupPreview();
     setCheckedCuts((checked) => new Set([
       ...checked,
-      ...(cleanupReport?.proposals.flatMap((cut, index) => (cut.kind === 'pause') === pauses ? [index] : []) ?? []),
+      ...(cleanupReport?.proposals.flatMap((cut, index) => (cut.kind === 'pause') === pauses && !cut.watch ? [index] : []) ?? []),
     ]));
   }
 
@@ -789,28 +799,44 @@ export function Editor({
       const sizes = list.map((file) =>
         typeof file === 'string' ? { size: originals[file]?.size ?? 0 } : file,
       );
+      async function importOne(file: File | string, index: number) {
+        if (typeof file === 'string') {
+          const original = originals[file];
+          if (!original) throw new Error('Asset unavailable or unsupported');
+          return inspectMedia({ ...original, filePath: file }, controller.signal);
+        }
+        if (!(
+          file.type.startsWith('video/') ||
+          file.type.startsWith('audio/') ||
+          /\.(mp4|mov|m4v|webm|mkv|avi|mp3|wav|m4a|aac|ogg|flac)$/i.test(
+            file.name,
+          )
+        )) {
+          throw new Error('Unsupported file');
+        }
+        const clip = await inspectMedia(file, controller.signal);
+        controller.signal.throwIfAborted();
+        // Copying the file into browser storage is the slow half for big clips.
+        report(index, 0.5);
+        await storeMedia(clip.id, file);
+        return clip;
+      }
+      const progress = list.map(() => 0);
+      const report = (index: number, value: number) => {
+        progress[index] = value;
+        if (!controller.signal.aborted) setImportProgress([...progress]);
+      };
+      setImportProgress([...progress]);
       const results = await mapConcurrent(
-        list,
+        list.map((file, index) => ({ file, index })),
         importConcurrency(sizes, navigator.hardwareConcurrency, memoryGiB),
-        async (file) => {
-          if (typeof file === 'string') {
-            const original = originals[file];
-            if (!original) throw new Error('Asset unavailable or unsupported');
-            return inspectMedia({ ...original, filePath: file }, controller.signal);
+        async ({ file, index }) => {
+          report(index, 0.1);
+          try {
+            return await importOne(file, index);
+          } finally {
+            report(index, 1);
           }
-          if (!(
-            file.type.startsWith('video/') ||
-            file.type.startsWith('audio/') ||
-            /\.(mp4|mov|m4v|webm|mkv|avi|mp3|wav|m4a|aac|ogg|flac)$/i.test(
-              file.name,
-            )
-          )) {
-            throw new Error('Unsupported file');
-          }
-          const clip = await inspectMedia(file, controller.signal);
-          controller.signal.throwIfAborted();
-          await storeMedia(clip.id, file);
-          return clip;
         },
         controller.signal,
       );
@@ -844,6 +870,7 @@ export function Editor({
       importController.current = null;
       if (!controller.signal.aborted) {
         setImporting(false);
+        setImportProgress(null);
         if (inputRef.current) inputRef.current.value = '';
       }
     }
@@ -1229,11 +1256,17 @@ export function Editor({
             onClick={openImport}
             disabled={importing}
           >
-            <Icon name="upload" size={20} />
-            <strong>
-              {importing ? 'Importing your clips...' : 'Import clips'}
-            </strong>
-            <span>or drop your files here</span>
+            {importProgress ? (
+              <ImportProgress progress={importProgress} />
+            ) : (
+              <>
+                <Icon name="upload" size={20} />
+                <strong>
+                  {importing ? 'Opening your clips...' : 'Import clips'}
+                </strong>
+                <span>or drop your files here</span>
+              </>
+            )}
           </button>
           <div className="media-footer">
             <span>{project.clips.length} clips</span>
@@ -2015,6 +2048,34 @@ export function Editor({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function ImportProgress({ progress }: { progress: number[] }) {
+  const total = progress.length;
+  const done = progress.filter((value) => value >= 1).length;
+  const percent = Math.round(
+    (progress.reduce((sum, value) => sum + value, 0) / total) * 100,
+  );
+  return (
+    <div className="import-progress" role="status" aria-live="polite">
+      <strong>
+        Importing {total === 1 ? 'your clip' : `${total} clips`}
+      </strong>
+      <div
+        className="import-progress-bar"
+        role="progressbar"
+        aria-label="Import progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+      >
+        <i style={{ width: `${percent}%` }} />
+      </div>
+      <span>
+        {total === 1 ? `${percent}%` : `${done} of ${total} done · ${percent}%`}
+      </span>
     </div>
   );
 }

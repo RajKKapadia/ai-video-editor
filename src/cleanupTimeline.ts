@@ -12,6 +12,10 @@ export type CleanupProposal = {
   removedText: string | null;
   keptText: string | null;
   reason?: string;
+  /** A measured pause over a changing picture that no model judged; never bulk-selected. */
+  watch?: boolean;
+  /** Instruction-edit log entry, marked applied when this cut is applied. */
+  editId?: number;
 };
 export type AssistantMessage = { id: number; role: 'user' | 'assistant'; text: string };
 export type PlanningDiagnostics = {

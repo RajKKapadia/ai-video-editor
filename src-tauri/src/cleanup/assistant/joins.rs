@@ -53,6 +53,7 @@ impl Alternative {
     pub fn proposal(&self, reason: &str) -> Option<Proposal> {
         let reason = bounded(reason, 350);
         (!reason.is_empty()).then(|| Proposal {
+            watch: false,
             kind: if self.after == self.before {
                 "retake"
             } else {

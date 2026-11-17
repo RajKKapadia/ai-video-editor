@@ -130,6 +130,7 @@ export function CutReview({
   report, checked, invalidSelection, onToggle, onSelectPauses, onSelectRetakes, onClearSelection,
   onAudition, onPreview, reviewingPauses = false, assistant = false,
 }: CutReviewProps & { report: CleanupReport; reviewingPauses?: boolean; assistant?: boolean }) {
+  const watched = report.proposals.filter((proposal) => proposal.watch).length;
   return (
     <>
       {report.retakeIssue && <p className="cleanup-warning" role="status">{report.retakeIssue}</p>}
@@ -175,6 +176,7 @@ export function CutReview({
           )}
           <button type="button" className="text-link" disabled={!checked.size} onClick={onClearSelection}>Clear selection</button>
           <p className="provider-note">{checked.size} of {report.proposals.length} selected. Only checked cuts are applied.</p>
+          {watched > 0 && <p className="provider-note">{watched} {watched === 1 ? 'pause has' : 'pauses have'} a changing picture and {watched === 1 ? 'is' : 'are'} left out of Select all pauses. Play {watched === 1 ? 'it' : 'them'} before selecting.</p>}
           <p className="provider-note">The draft and your selection save automatically with this project.</p>
         </div>}
         <ul className="cleanup-results">
@@ -192,7 +194,7 @@ export function CutReview({
                 {proposal.removedText && <p><strong>Remove</strong> {proposal.removedText}</p>}
                 {proposal.keptText && <p><strong>Keep</strong> {proposal.keptText}</p>}
                 <div>
-                  {(assistant || proposal.keep) && <button className="text-link" onClick={() => onAudition(proposal.remove)}>
+                  {(assistant || proposal.keep || proposal.watch) && <button className="text-link" onClick={() => onAudition(proposal.remove)}>
                     {proposal.keep ? 'Play removed take' : proposal.kind === 'pause' ? 'Play original gap' : 'Play proposed removal'}
                   </button>}
                   {proposal.keep && <button className="text-link" onClick={() => proposal.keep && onAudition(proposal.keep)}>Play kept take</button>}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { isTauri } from '@tauri-apps/api/core';
-import { createProject } from './cache';
+import { createProject, deleteCacheEntries, projectCacheKeys } from './cache';
 import { useProjectCache } from './useProjectCache';
 import { Icon } from './Icon';
 import { Editor } from './Editor';
@@ -157,6 +157,39 @@ function NewProject({
   );
 }
 
+function DeleteProject({
+  project,
+  onClose,
+  onDelete,
+}: {
+  project: Project;
+  onClose: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <Modal title="Delete this project?" onClose={onClose}>
+      <div className="modal-symbol danger">
+        <Icon name="trash" size={24} />
+      </div>
+      <p className="modal-intro">
+        “{project.name}” and its timeline will be removed from this device.
+        {project.clips.some((clip) => clip.filePath)
+          ? ' Your original media files stay where they are.'
+          : ''}{' '}
+        This can’t be undone.
+      </p>
+      <div className="modal-actions">
+        <button className="button secondary" type="button" onClick={onClose} autoFocus>
+          Cancel
+        </button>
+        <button className="button danger" type="button" onClick={onDelete}>
+          <Icon name="trash" size={15} /> Delete project
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 const shortcutRows = [
   ['A', 'Previous cut / source mark'],
   ['S', 'Next cut / source mark'],
@@ -226,6 +259,7 @@ export default function App() {
     }
   });
   const [newProject, setNewProject] = useState(false);
+  const [deleting, setDeleting] = useState<Project | null>(null);
   const [shortcuts, setShortcuts] = useState(false);
   const [providerSettings, setProviderSettings] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'speech' | 'providers'>('speech');
@@ -506,9 +540,9 @@ export default function App() {
                   className={`project-grid ${view === 'list' ? 'project-list' : ''}`}
                 >
                   {visible.map((project) => (
+                    <div className="project-item" key={project.id}>
                     <button
                       className="project-card"
-                      key={project.id}
                       onClick={() => open(project.id)}
                     >
                       <div className="project-cover">
@@ -546,6 +580,15 @@ export default function App() {
                         <Icon name="arrow" size={18} />
                       </div>
                     </button>
+                    <button
+                      className="project-delete"
+                      onClick={() => setDeleting(project)}
+                      aria-label={`Delete ${project.name}`}
+                      title="Delete project"
+                    >
+                      <Icon name="trash" size={15} />
+                    </button>
+                    </div>
                   ))}
                   {!search && (
                     <button
@@ -592,6 +635,20 @@ export default function App() {
             setProjects((items) => [project, ...items]);
             setNewProject(false);
             open(project.id);
+          }}
+        />
+      )}
+      {deleting && (
+        <DeleteProject
+          project={deleting}
+          onClose={() => setDeleting(null)}
+          onDelete={() => {
+            const removed = deleting;
+            setProjects((items) => items.filter((item) => item.id !== removed.id));
+            setDeleting(null);
+            // Browser imports keep their media in IndexedDB; desktop clips link
+            // to the originals, so only cached waveforms are dropped there.
+            void deleteCacheEntries(projectCacheKeys(removed)).catch(() => {});
           }}
         />
       )}

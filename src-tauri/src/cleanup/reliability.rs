@@ -332,7 +332,11 @@ async fn real_project_cleanup() {
                         utterances: utterances.clone(),
                     }),
                 );
-                Analysis { pauses, utterances }
+                Analysis {
+                    pauses,
+                    utterances,
+                    motion: Vec::new(),
+                }
             };
         results.push(Some(Arc::new(analysis)));
     }

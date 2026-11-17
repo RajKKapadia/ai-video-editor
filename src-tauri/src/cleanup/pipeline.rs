@@ -16,7 +16,7 @@ use super::{
     LOCAL_TRANSCRIPT_TOO_LARGE as TRANSCRIPT_TOO_LARGE, MediaInput, Session,
     audio::{Engine, PreparedAudio},
     cache::{Cache, Transcript, linked_key},
-    progress, speech, transcript_store, transcription_api,
+    motion, progress, speech, transcript_store, transcription_api,
     worker::Transcriber,
 };
 
@@ -129,7 +129,7 @@ struct MediaRevision {
 
 fn decode(
     mut sources: mpsc::Receiver<Source>,
-    ready: SyncSender<(usize, PreparedRange)>,
+    ready: SyncSender<(usize, PreparedRange, Vec<Option<f64>>)>,
     vad: &Path,
     progress: &PipelineProgress<'_>,
     transcribing: &AtomicBool,
@@ -199,11 +199,31 @@ fn decode(
                 }
             };
             session.control.check()?;
+            // Measure the picture during each pause while the source is still
+            // available; uploaded media is released after this loop.
+            let pauses = match &audio {
+                _ if !session.pauses => Vec::new(),
+                PreparedRange::Cached(analysis, ..) => analysis.pauses.clone(),
+                PreparedRange::Decoded(Some(prepared), _) => prepared.detected.pauses(),
+                _ => Vec::new(),
+            };
+            let motion = pauses
+                .iter()
+                .map(|gap| {
+                    motion::measure(
+                        &session.decoder,
+                        input.path(),
+                        gap.offset(range.start),
+                        &session.control,
+                    )
+                })
+                .collect();
+            session.control.check()?;
             progress.update(|state| {
                 state.preparing = 0.0;
                 state.prepared += 1;
             });
-            if ready.send((index, audio)).is_err() {
+            if ready.send((index, audio, motion)).is_err() {
                 return session.control.check();
             }
         }
@@ -235,8 +255,12 @@ fn decode(
     session.control.check()
 }
 
+/// Two sources failing one after another means the engine or key is at fault,
+/// not the recordings, so transcription stops for the rest of the timeline.
+const MAX_FAILURES_IN_ROW: usize = 2;
+
 fn collect(
-    prepared: Receiver<(usize, PreparedRange)>,
+    prepared: Receiver<(usize, PreparedRange, Vec<Option<f64>>)>,
     transcriber: &mut Option<Transcriber<'_>>,
     remote: Option<&transcription_api::Transcriber>,
     selection: Option<&speech::Selection>,
@@ -252,6 +276,11 @@ fn collect(
     let mut failed = HashSet::new();
     let mut text_bytes = 0;
     let mut issue = None;
+    // Per-source transcription failures. Other sources keep their transcripts
+    // unless failures repeat back to back, which points at the engine or key.
+    let mut untranscribed: Vec<(usize, String)> = Vec::new();
+    let mut failures_in_row = 0;
+    let mut transcribed_any = false;
     let mut notice = None;
     let mut devices = HashSet::new();
     let mut device = if remote.is_some() {
@@ -261,7 +290,7 @@ fn collect(
             .and_then(|selection| selection.device.as_ref())
             .map_or("CPU", |device| device.name.as_str())
     };
-    for (index, audio) in prepared {
+    for (index, audio, motion) in prepared {
         session.control.check()?;
         let run = &session.runs[index];
         let cached = matches!(audio, PreparedRange::Cached(..));
@@ -272,9 +301,16 @@ fn collect(
             }
         };
         let result = match audio {
-            PreparedRange::Repeated(first, _) => results[first].clone(),
-            PreparedRange::Cached(analysis, device, _) => {
+            PreparedRange::Repeated(first, _) => {
+                if let Some((_, error)) = untranscribed.iter().find(|(run, _)| *run == first) {
+                    untranscribed.push((index, error.clone()));
+                }
+                results[first].clone()
+            }
+            PreparedRange::Cached(mut analysis, device, _) => {
+                transcribed_any |= model.is_some();
                 devices.extend(device);
+                analysis.motion = motion;
                 Some(Arc::new(analysis))
             }
             PreparedRange::Decoded(None, _) => {
@@ -286,6 +322,7 @@ fn collect(
                 let mut transcript = None;
                 if session.pauses {
                     result.pauses = audio.detected.pauses();
+                    result.motion = motion;
                 }
                 if let (Some(pcm), Some(model)) = (audio.pcm, model)
                     && transcribing.load(Ordering::Relaxed)
@@ -314,6 +351,8 @@ fn collect(
                     };
                     match outcome {
                         Ok((utterances, fallback)) => {
+                            failures_in_row = 0;
+                            transcribed_any = true;
                             result.utterances = utterances;
                             if fallback {
                                 device = "CPU";
@@ -335,7 +374,13 @@ fn collect(
                                 utterances: result.utterances.clone(),
                             });
                         }
-                        Err(error) => issue = Some(error),
+                        Err(error) => {
+                            failures_in_row += 1;
+                            if failures_in_row >= MAX_FAILURES_IN_ROW {
+                                issue = Some(error.clone());
+                            }
+                            untranscribed.push((index, error));
+                        }
                     }
                     session.control.check()?;
                 }
@@ -415,6 +460,15 @@ fn collect(
         devices.into_iter().next()
     };
     data.failed.extend(failed);
+    if issue.is_none()
+        && !transcribed_any
+        && let Some((_, error)) = untranscribed.first()
+    {
+        issue = Some(error.clone());
+    }
+    if issue.is_none() {
+        data.untranscribed = untranscribed;
+    }
     if let Some(issue) = issue {
         data.retake_issue = Some(issue);
         data.connection = None;

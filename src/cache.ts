@@ -164,6 +164,22 @@ export async function writeCacheEntry(id: string, value: unknown) {
     tx.onabort = () => reject(tx.error);
   });
 }
+export async function deleteCacheEntries(ids: string[]) {
+  if (!ids.length) return;
+  const db = await openDatabase();
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('files', 'readwrite');
+    const store = tx.objectStore('files');
+    ids.forEach((id) => store.delete(id));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+/** Media blobs and cached waveforms that belong to a project's clips. */
+export function projectCacheKeys(project: Project) {
+  return project.clips.flatMap((clip) => [clip.id, `waveform.v1:${clip.id}`]);
+}
 export function storeMedia(id: string, file: Blob) {
   return writeCacheEntry(id, file);
 }

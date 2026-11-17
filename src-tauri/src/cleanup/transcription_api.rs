@@ -230,9 +230,46 @@ fn decode(json: &str, duration: f64) -> Result<Vec<Word>, String> {
                 .into(),
         );
     }
+    tidy(words, duration)
+}
+
+/// How far past the uploaded audio a word may end before the reply is treated
+/// as wrong rather than rounded. `whisper-1` often stamps the last word a
+/// little beyond the end of the clip.
+const END_SLACK: f64 = 0.5;
+
+/// `whisper-1` word timestamps routinely overlap their neighbour by a few
+/// hundredths of a second and can end slightly after the audio. Trim those to
+/// touch instead of rejecting the source; words that start out of order or far
+/// outside the upload are still errors.
+fn tidy(mut words: Vec<Word>, duration: f64) -> Result<Vec<Word>, String> {
+    for index in 0..words.len() {
+        let next_start = words.get(index + 1).map(|next| next.speech.start);
+        let word = &mut words[index];
+        let speech = &mut word.speech;
+        if word.text.is_empty()
+            || !speech.start.is_finite()
+            || !speech.end.is_finite()
+            || speech.start < 0.0
+            || speech.start > duration
+            || speech.end < speech.start
+            || speech.end > duration + END_SLACK
+            || next_start.is_some_and(|next| next < speech.start)
+        {
+            return Err(AMBIGUOUS.into());
+        }
+        speech.end = speech
+            .end
+            .min(duration)
+            .min(next_start.unwrap_or(f64::INFINITY));
+    }
     validate_order(&words, duration)?;
     Ok(words)
 }
+
+const AMBIGUOUS: &str =
+    "OpenAI returned ambiguous word boundaries. This source was left for review.";
+
 fn validate_order(words: &[Word], duration: f64) -> Result<(), String> {
     if words.iter().any(|word| {
         word.text.is_empty()
@@ -245,9 +282,7 @@ fn validate_order(words: &[Word], duration: f64) -> Result<(), String> {
         .windows(2)
         .any(|pair| pair[0].speech.end > pair[1].speech.start + 0.000_001)
     {
-        return Err(
-            "OpenAI returned ambiguous word boundaries. This source was left for review.".into(),
-        );
+        return Err(AMBIGUOUS.into());
     }
     Ok(())
 }
@@ -267,11 +302,18 @@ mod tests {
         let words = decode(good, 1.0).unwrap();
         assert_eq!(words.len(), 2);
         assert!(decode(&good.replace("\"end\":0.9", "\"end\":0.5"), 1.0).is_ok());
+        // Small overlaps and a last word ending just past the audio are trimmed.
+        let overlap = decode(&good.replace("\"start\":0.5", "\"start\":0.3"), 1.0).unwrap();
+        assert_eq!(overlap[0].speech.end, 0.3);
+        assert_eq!(overlap[1].speech.start, 0.3);
+        let late = decode(&good.replace("\"end\":0.9", "\"end\":1.2"), 1.0).unwrap();
+        assert_eq!(late[1].speech.end, 1.0);
         for bad in [
             good.replace("world!\",\"words", "else!\",\"words"),
-            good.replace("\"start\":0.5", "\"start\":0.3"),
+            good.replace("\"start\":0.5", "\"start\":0.05"),
             good.replace("\"end\":0.9", "\"end\":2.0"),
             good.replace("\"end\":0.9", "\"end\":0.4"),
+            good.replace("\"start\":0.1", "\"start\":-0.1"),
             r#"{"text":"Hello"}"#.to_owned(),
         ] {
             assert!(decode(&bad, 1.0).is_err());

@@ -1,8 +1,11 @@
+pub(crate) mod agent;
 pub(crate) mod assistant;
 mod audio;
 mod cache;
 mod models;
+mod motion;
 mod pipeline;
+mod projection;
 pub(crate) mod providers;
 #[cfg(test)]
 mod reliability;
@@ -189,6 +192,9 @@ struct Data {
     staged: bool,
     pending: HashSet<String>,
     failed: HashSet<String>,
+    /// Runs whose transcription failed on their own, with the reason. Their
+    /// pauses are reviewed locally and no transcript cut may touch them.
+    untranscribed: Vec<(usize, String)>,
     results: Vec<Option<Arc<Analysis>>>,
     verification_models: Option<(PathBuf, PathBuf)>,
     verification_sources: std::collections::HashMap<String, verification::Source>,
@@ -580,6 +586,10 @@ pub(crate) struct Proposal {
     kept_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// A measured pause over a changing picture that no model judged. It is
+    /// left out of "Select all pauses" so it is only removed after a look.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    watch: bool,
 }
 
 #[derive(Serialize)]
@@ -731,13 +741,14 @@ async fn proposals(
     retake_issue: Option<String>,
     failed_sources: usize,
 ) -> Result<Report, String> {
-    let (speech, runtime_notice, processing_device, cache_issue) = {
+    let (speech, runtime_notice, processing_device, cache_issue, untranscribed) = {
         let mut data = session.data.lock().unwrap();
         (
             data.speech.clone(),
             data.runtime_notice.clone(),
             data.processing_device.take(),
             data.analysis_cache_issue.take(),
+            std::mem::take(&mut data.untranscribed),
         )
     };
     let mut report = Report {
@@ -762,24 +773,42 @@ async fn proposals(
     if failed_sources != 0 {
         report.review_notes.push("Analysis is incomplete. Unavailable sources were left unchanged; restore their media and analyze again to finish cleanup.".into());
     }
-    let candidates: Vec<_> = session
+    let measured: Vec<_> = session
         .runs
         .iter()
         .zip(&results)
         .enumerate()
         .flat_map(|(index, (run, result))| {
-            result
-                .iter()
-                .flat_map(|result| &result.pauses)
-                .map(move |range| (index, range.offset(run.timeline_start)))
+            result.iter().flat_map(move |result| {
+                result.pauses.iter().enumerate().map(move |(gap, range)| {
+                    (
+                        index,
+                        range.offset(run.timeline_start),
+                        result.motion.get(gap).copied().flatten(),
+                    )
+                })
+            })
         })
         .collect();
+    let labels = motion::label(
+        &measured
+            .iter()
+            .map(|(_, _, score)| *score)
+            .collect::<Vec<_>>(),
+    );
+    let candidates: Vec<Candidate> = measured
+        .into_iter()
+        .zip(labels)
+        .map(|((run, range, _), motion)| Candidate { run, range, motion })
+        .collect();
+    let partial = Untranscribed::new(&session.runs, &untranscribed, &candidates);
+    report.review_notes.extend(partial.notes());
     let duration = session
         .runs
         .last()
         .map_or(0.0, |run| run.timeline_start + run.source.duration());
     let mut quiet_coverage = 0.0_f64;
-    for (_, range) in &candidates {
+    for Candidate { range, .. } in &candidates {
         if range.start <= quiet_coverage + 0.000_001 {
             quiet_coverage = quiet_coverage.max(range.end);
         }
@@ -789,13 +818,15 @@ async fn proposals(
     if session.assistant.is_none() {
         report
             .proposals
-            .extend(candidates.iter().map(|(_, range)| Proposal {
+            .extend(candidates.iter().map(|candidate| Proposal {
                 kind: "pause",
-                remove: *range,
+                remove: candidate.range,
                 keep: None,
                 removed_text: None,
                 kept_text: None,
-                reason: None,
+                reason:
+                    (candidate.motion == motion::Motion::Active).then(|| ACTIVE_PAUSE_NOTE.into()),
+                watch: candidate.motion == motion::Motion::Active,
             }));
     }
     session.control.check()?;
@@ -859,7 +890,7 @@ async fn proposals(
             .filter(|transcript| !transcript.utterances.is_empty())
             .ok_or("No speech was transcribed from the current timeline.")?;
         let connection = connection.ok_or("The assistant’s AI provider is unavailable.")?;
-        let gaps = assistant::transcript_gaps(candidates.iter().copied(), &utterances);
+        let gaps = assistant::measured_gaps(partial.reviewable.iter().copied(), &utterances);
         progress(app, &session.id, stage.progress(), None);
         if drafting {
             let draft = assistant::draft::run(
@@ -901,6 +932,7 @@ async fn proposals(
             report.proposals = draft.proposals;
             report.draft_summary = Some(draft.summary);
             report.review_notes.extend(draft.notes);
+            partial.cover(&mut report.proposals, true);
             return Ok(report);
         }
         let reviewed = assistant::review(
@@ -925,6 +957,7 @@ async fn proposals(
         report.proposals = proposals;
         report.assistant_turn = Some(turn);
         report.review_notes.extend(notes);
+        partial.cover(&mut report.proposals, session.pauses);
         session.control.check()?;
         return Ok(report);
     }
@@ -945,6 +978,8 @@ async fn proposals(
             Err(error) => report.retake_issue = Some(error),
         }
     }
+    // Basic analysis already proposed every measured pause.
+    partial.cover(&mut report.proposals, false);
     session.control.check()?;
     report
         .proposals
@@ -952,27 +987,108 @@ async fn proposals(
     Ok(report)
 }
 
-fn local_pause_review(report: &mut Report, candidates: &[(usize, Range)]) {
-    report.proposals = candidates
-        .iter()
-        .map(|(_, range)| Proposal {
-            kind: "pause",
-            remove: *range,
-            keep: None,
-            removed_text: None,
-            kept_text: None,
-            reason: Some(
-                "Measured quiet audio. Review whether this is an intentional wait before applying."
-                    .into(),
-            ),
+/// A measured pause that the planner can review, with picture activity.
+#[derive(Clone, Copy)]
+struct Candidate {
+    run: usize,
+    range: Range,
+    motion: motion::Motion,
+}
+
+/// Sources whose transcription failed while the rest of the timeline was
+/// transcribed. The planner never sees their gaps (it would mistake their
+/// untranscribed speech for silence), and no transcript cut may reach into
+/// them; their pauses are offered as local measurements instead.
+struct Untranscribed<'a> {
+    runs: Vec<(usize, Range, &'a str)>,
+    reviewable: Vec<Candidate>,
+    local: Vec<Candidate>,
+}
+
+impl<'a> Untranscribed<'a> {
+    fn new(runs: &[Run], failed: &'a [(usize, String)], candidates: &[Candidate]) -> Self {
+        let runs: Vec<_> = failed
+            .iter()
+            .filter_map(|(index, error)| {
+                let run = runs.get(*index)?;
+                let range = Range::new(
+                    run.timeline_start,
+                    run.timeline_start + run.source.duration(),
+                );
+                Some((*index, range, error.as_str()))
+            })
+            .collect();
+        let (local, reviewable) = candidates
+            .iter()
+            .partition(|candidate| runs.iter().any(|(run, ..)| *run == candidate.run));
+        Self {
+            runs,
+            reviewable,
+            local,
+        }
+    }
+
+    fn notes(&self) -> impl Iterator<Item = String> + '_ {
+        self.runs.iter().map(|(index, range, error)| {
+            format!(
+                "Source {} (starting at {}) could not be transcribed: {error} Its pauses are local measurements only, and repeated takes in it were not checked.",
+                index + 1,
+                clock(range.start),
+            )
         })
-        .collect();
+    }
+
+    /// Drops transcript cuts that reach into an untranscribed source and, when
+    /// pauses were requested, adds that source's measured pauses for review.
+    fn cover(&self, proposals: &mut Vec<Proposal>, add_pauses: bool) {
+        if self.runs.is_empty() {
+            return;
+        }
+        proposals.retain(|proposal| {
+            proposal.kind == "pause"
+                || !self.runs.iter().any(|(_, range, _)| {
+                    proposal.remove.start < range.end && proposal.remove.end > range.start
+                })
+        });
+        if add_pauses {
+            proposals.extend(self.local.iter().map(local_pause));
+        }
+        proposals.sort_by(|left, right| left.remove.start.total_cmp(&right.remove.start));
+    }
+}
+
+fn clock(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+const ACTIVE_PAUSE_NOTE: &str = "The picture changes during this pause, which may be a demonstration. Watch it before applying.";
+
+fn local_pause_review(report: &mut Report, candidates: &[Candidate]) {
+    report.proposals = candidates.iter().map(local_pause).collect();
     report.draft_summary = Some(if report.can_clear_timeline {
         "The analyzed sequence contains only measured quiet audio. Applying these removals clears the timeline; Undo restores it.".into()
     } else {
         "Quiet gaps are available for manual review. Repeated material and the purpose of these pauses were not fully checked.".into()
     });
     report.review_notes.push("These are local audio measurements. No contextual decision was made about intentional pauses or repeated takes.".into());
+}
+
+fn local_pause(candidate: &Candidate) -> Proposal {
+    Proposal {
+        watch: candidate.motion == motion::Motion::Active,
+        kind: "pause",
+        remove: candidate.range,
+        keep: None,
+        removed_text: None,
+        kept_text: None,
+        reason: Some(if candidate.motion == motion::Motion::Active {
+            ACTIVE_PAUSE_NOTE.into()
+        } else {
+            "Measured quiet audio. Review whether this is an intentional wait before applying."
+                .into()
+        }),
+    }
 }
 
 async fn save_transcript(
@@ -1112,6 +1228,67 @@ pub(crate) fn cleanup_cancel(state: State<'_, CleanupJobs>, id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_untranscribed_source_keeps_local_pauses_and_no_transcript_cuts() {
+        let run = |start: f64, end: f64| Run {
+            clip_id: "clip".into(),
+            source: Range::new(0.0, end - start),
+            timeline_start: start,
+            analyze: true,
+        };
+        let runs = [run(0.0, 10.0), run(10.0, 20.0), run(20.0, 30.0)];
+        let candidate = |run, start, end, motion| Candidate {
+            run,
+            range: Range::new(start, end),
+            motion,
+        };
+        let candidates = [
+            candidate(0, 4.0, 5.0, motion::Motion::Still),
+            candidate(1, 12.0, 13.0, motion::Motion::Still),
+            candidate(1, 15.0, 18.0, motion::Motion::Active),
+        ];
+        let failed = [(1, "OpenAI timed out.".to_owned())];
+        let partial = Untranscribed::new(&runs, &failed, &candidates);
+        // The planner only sees pauses from sources it has a transcript for.
+        assert_eq!(partial.reviewable.len(), 1);
+        assert_eq!(partial.reviewable[0].run, 0);
+        let notes: Vec<_> = partial.notes().collect();
+        assert!(notes[0].starts_with(
+            "Source 2 (starting at 0:10) could not be transcribed: OpenAI timed out."
+        ));
+
+        let cut = |kind, start, end| Proposal {
+            watch: false,
+            kind,
+            remove: Range::new(start, end),
+            keep: None,
+            removed_text: None,
+            kept_text: None,
+            reason: None,
+        };
+        let mut proposals = vec![
+            cut("pause", 4.0, 5.0),
+            cut("retake", 6.0, 8.0),
+            cut("retake", 9.0, 11.0),
+            cut("cut", 22.0, 24.0),
+        ];
+        partial.cover(&mut proposals, true);
+        let kept: Vec<_> = proposals
+            .iter()
+            .map(|p| (p.kind, p.remove.start, p.watch))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("pause", 4.0, false),
+                ("retake", 6.0, false),
+                ("pause", 12.0, false),
+                ("pause", 15.0, true),
+                ("cut", 22.0, false),
+            ]
+        );
+    }
 
     #[test]
     fn audits_keep_each_run_and_never_recreate_a_deleted_workspace() {

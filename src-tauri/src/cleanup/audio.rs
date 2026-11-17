@@ -53,6 +53,10 @@ impl Control {
 pub(super) struct Analysis {
     pub pauses: Vec<Range>,
     pub utterances: Vec<Utterance>,
+    /// Picture activity for each entry of `pauses`, measured on every run
+    /// because it depends on the video rather than the cached audio analysis.
+    #[serde(skip)]
+    pub motion: Vec<Option<f64>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -202,6 +206,7 @@ impl Engine {
         let mut carry = 0;
         let mut offset = 0;
         let mut frames_read = 0;
+        let mut levels = Vec::new();
         let mut params = WhisperVadParams::default();
         params.set_min_speech_duration(100);
         params.set_min_silence_duration(100);
@@ -246,13 +251,11 @@ impl Engine {
                     .chunks(ENERGY_BIN * FRAME_BYTES)
                     .enumerate()
                 {
-                    if quiet_bin(bin) {
-                        let start = offset + first + index * ENERGY_BIN;
-                        extend_range(
-                            &mut detected.quiet,
-                            Range::new(seconds(start), seconds(start + bin.len() / FRAME_BYTES)),
-                        );
-                    }
+                    let start = offset + first + index * ENERGY_BIN;
+                    levels.push(BinLevel {
+                        range: Range::new(seconds(start), seconds(start + bin.len() / FRAME_BYTES)),
+                        level: bin_level(bin),
+                    });
                 }
             }
             let decoded = (seconds(frames_read) / duration).min(1.0);
@@ -265,7 +268,83 @@ impl Engine {
             bytes.copy_within((WINDOW - carry) * FRAME_BYTES.., 0);
         }
         detected.duration = seconds(frames_read).min(duration);
+        let threshold = QuietThreshold::measure(&levels, &detected.speech);
+        for bin in levels {
+            if threshold.is_quiet(bin.level) {
+                extend_range(&mut detected.quiet, bin.range);
+            }
+        }
         Ok(detected)
+    }
+}
+
+struct BinLevel {
+    range: Range,
+    level: Level,
+}
+
+/// RMS and peak amplitude of one 20 ms bin, using the louder channel.
+#[derive(Clone, Copy)]
+struct Level {
+    rms: f32,
+    peak: f32,
+}
+
+/// Quiet means "near this recording's own noise floor", not a fixed level.
+/// A clean studio recording keeps the original −40 dBFS RMS / −30 dBFS peak
+/// limits; a room with a fan or preamp hiss raises them, up to −30 dBFS RMS
+/// and −20 dBFS peak, so its pauses and cut boundaries remain measurable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct QuietThreshold {
+    rms: f32,
+    peak: f32,
+}
+
+const QUIET_RMS: f32 = 0.01; // −40 dBFS
+const QUIET_PEAK: f32 = 0.0316; // −30 dBFS
+const MAX_QUIET_RMS: f32 = 0.0316; // −30 dBFS
+const MAX_QUIET_PEAK: f32 = 0.1; // −20 dBFS
+/// Half a second of non-speech audio is enough to estimate a floor.
+const MIN_FLOOR_BINS: usize = 25;
+
+impl Default for QuietThreshold {
+    fn default() -> Self {
+        Self {
+            rms: QUIET_RMS,
+            peak: QUIET_PEAK,
+        }
+    }
+}
+
+impl QuietThreshold {
+    fn measure(levels: &[BinLevel], speech: &[Range]) -> Self {
+        // Estimate the floor only from audio the voice detector did not mark
+        // as speech, so continuous talking cannot raise the quiet threshold.
+        let mut floor: Vec<f32> = levels
+            .iter()
+            .filter(|bin| {
+                let index = speech.partition_point(|range| range.end <= bin.range.start);
+                speech
+                    .get(index)
+                    .is_none_or(|range| !range.overlaps(bin.range))
+            })
+            .map(|bin| bin.level.rms)
+            .collect();
+        if floor.len() < MIN_FLOOR_BINS {
+            return Self::default();
+        }
+        floor.sort_by(f32::total_cmp);
+        let noise = floor[floor.len() / 4];
+        // Quiet is within about 6 dB of the floor, peaks within about 16 dB.
+        let rms = (noise * 2.0).clamp(QUIET_RMS, MAX_QUIET_RMS);
+        Self {
+            rms,
+            peak: (rms * 3.16).clamp(QUIET_PEAK, MAX_QUIET_PEAK),
+        }
+    }
+
+    fn is_quiet(self, level: Level) -> bool {
+        level.rms <= self.rms && level.peak <= self.peak
     }
 }
 
@@ -318,7 +397,7 @@ pub(super) fn mono(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn quiet_bin(bin: &[u8]) -> bool {
+fn bin_level(bin: &[u8]) -> Level {
     let mut squares = 0.0;
     let mut peak: f32 = 0.0;
     for frame in bin.chunks_exact(FRAME_BYTES) {
@@ -326,8 +405,11 @@ fn quiet_bin(bin: &[u8]) -> bool {
         squares += amplitude * amplitude;
         peak = peak.max(amplitude);
     }
-    // At most -40 dBFS RMS and -30 dBFS peak in each 20 ms bin.
-    squares <= 0.0001 * (bin.len() / FRAME_BYTES) as f32 && peak <= 0.0316
+    let frames = (bin.len() / FRAME_BYTES).max(1) as f32;
+    Level {
+        rms: (squares / frames).sqrt(),
+        peak,
+    }
 }
 
 fn seconds(frames: usize) -> f64 {
@@ -381,6 +463,7 @@ impl Detected {
                         ..line.clone()
                     })
                     .collect(),
+                motion: Vec::new(),
             });
         };
         // Only reuse whole speech groups. A clip boundary through a group could
@@ -453,6 +536,7 @@ impl Detected {
                     }
                 })
                 .collect(),
+            motion: Vec::new(),
         })
     }
 
@@ -895,10 +979,85 @@ mod tests {
 
     #[test]
     fn checks_both_channels_for_audible_sound() {
+        let threshold = QuietThreshold::default();
         let mut bytes = vec![0; ENERGY_BIN * FRAME_BYTES];
-        assert!(quiet_bin(&bytes));
+        assert!(threshold.is_quiet(bin_level(&bytes)));
         bytes[2..4].copy_from_slice(&2000_i16.to_le_bytes());
-        assert!(!quiet_bin(&bytes));
+        assert!(!threshold.is_quiet(bin_level(&bytes)));
+    }
+
+    fn bins(levels: &[(f64, f32)]) -> Vec<BinLevel> {
+        levels
+            .iter()
+            .map(|&(start, rms)| BinLevel {
+                range: Range::new(start, start + 0.02),
+                level: Level {
+                    rms,
+                    peak: rms * 2.0,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quiet_threshold_follows_the_room_noise_floor() {
+        // A clean recording keeps the original fixed limits.
+        let clean = bins(
+            &(0..100)
+                .map(|i| (i as f64 * 0.02, 0.0005))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            QuietThreshold::measure(&clean, &[]),
+            QuietThreshold::default()
+        );
+
+        // Fan noise at about −36 dBFS would never count as quiet with a fixed
+        // −40 dBFS limit. Its gaps are now measurable, while speech is not.
+        let noisy = bins(
+            &(0..100)
+                .map(|i| (i as f64 * 0.02, 0.016))
+                .collect::<Vec<_>>(),
+        );
+        let threshold = QuietThreshold::measure(&noisy, &[]);
+        assert!(threshold.is_quiet(Level {
+            rms: 0.016,
+            peak: 0.04
+        }));
+        assert!(!threshold.is_quiet(Level {
+            rms: 0.1,
+            peak: 0.3
+        }));
+
+        // Loud speech bins are excluded from the floor estimate, and a very
+        // loud "floor" is capped so speech cannot become quiet.
+        let mut talking = bins(&(0..200).map(|i| (i as f64 * 0.02, 0.2)).collect::<Vec<_>>());
+        talking.extend(bins(
+            &(200..230)
+                .map(|i| (i as f64 * 0.02, 0.0005))
+                .collect::<Vec<_>>(),
+        ));
+        let speech = [Range::new(0.0, 4.0)];
+        assert_eq!(
+            QuietThreshold::measure(&talking, &speech),
+            QuietThreshold::default()
+        );
+        let roaring = bins(&(0..100).map(|i| (i as f64 * 0.02, 0.2)).collect::<Vec<_>>());
+        assert!(!QuietThreshold::measure(&roaring, &[]).is_quiet(Level {
+            rms: 0.1,
+            peak: 0.2
+        }));
+
+        // Too little non-speech audio falls back to the fixed limits.
+        let short = bins(
+            &(0..10)
+                .map(|i| (i as f64 * 0.02, 0.016))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            QuietThreshold::measure(&short, &[]),
+            QuietThreshold::default()
+        );
     }
     #[test]
     #[ignore = "requires FFmpeg and downloaded speech fixtures"]

@@ -120,6 +120,15 @@ export function AssistantPanel({
               <button type="button" className="button primary" disabled={!canRun} onClick={() => submit('draft', adaptiveCleanupBrief)}>
                 Draft cleanup
               </button>
+              <button
+                type="button"
+                className="button secondary"
+                disabled={!canRun || !prompt.trim()}
+                title="Cuts what your direction asks for, using the transcript already stored for this project. Nothing is transcribed again."
+                onClick={() => submit('instruct', '')}
+              >
+                Edit by instruction
+              </button>
               <button type="submit" className="button secondary" disabled={!canRun || !prompt.trim()}>Ask about transcript</button>
             </div>
             <details className="assistant-advanced">

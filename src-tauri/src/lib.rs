@@ -24,6 +24,7 @@ pub fn run() {
         .manage(project_cache::ProjectCache::default())
         .manage(waveform::WaveformJob::default())
         .manage(cleanup::CleanupJobs::default())
+        .manage(cleanup::agent::AgentJobs::default())
         .manage(export::ExportJobs::default())
         .manage(cleanup::providers::Store::default())
         .manage(cleanup::speech::Store::default())
@@ -36,6 +37,7 @@ pub fn run() {
             if payload.event() == PageLoadEvent::Started {
                 webview.state::<waveform::WaveformJob>().cancel_active();
                 webview.state::<cleanup::CleanupJobs>().cancel_active();
+                webview.state::<cleanup::agent::AgentJobs>().cancel_all();
                 webview.state::<cleanup::speech::Store>().cancel();
                 webview.state::<export::ExportJobs>().cancel_active();
             }
@@ -49,6 +51,7 @@ pub fn run() {
             if matches!(event, WindowEvent::CloseRequested { .. }) {
                 window.state::<waveform::WaveformJob>().cancel_active();
                 window.state::<cleanup::CleanupJobs>().cancel_active();
+                window.state::<cleanup::agent::AgentJobs>().cancel_all();
                 window.state::<cleanup::speech::Store>().cancel();
                 window.state::<export::ExportJobs>().cancel_active();
             }
@@ -84,6 +87,9 @@ pub fn run() {
             cleanup::cleanup_source_skip,
             cleanup::cleanup_finish,
             cleanup::cleanup_cancel,
+            cleanup::agent::agent_run,
+            cleanup::agent::agent_cancel,
+            cleanup::agent::agent_edits_applied,
             cleanup::assistant::assistant_history,
             cleanup::speech::speech_status,
             cleanup::speech::speech_save,
