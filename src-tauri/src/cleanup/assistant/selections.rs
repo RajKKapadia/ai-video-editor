@@ -7,8 +7,8 @@ use super::{Range, TimelineUtterance, UtteranceRange, join_text, resolve, safe_r
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WordRange {
-    first: usize,
-    last: usize,
+    pub(super) first: usize,
+    pub(super) last: usize,
 }
 
 pub(super) fn word_range_schema() -> Value {

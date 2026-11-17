@@ -37,8 +37,14 @@ const INSTRUCTIONS: &str = concat!(
     "Propose only measured gap IDs or complete utterances with safe outer cut boundaries. ",
     "Consecutive utterances may cross existing timeline cuts; a run change does not mean a new take. ",
     "Gap context ID 0 means the beginning or end of the available speech. Remove recording lead-in and tail silence when dispensable. ",
+    "The goal is a single continuous take: when a passage is spoken more than once, keep one version unless the repetition is intentional. ",
     "When removing a repeated version of an utterance, always use kind retake and identify the complete kept range with all unique details. ",
     "Compare complete versions and assembled fragments by wording and completeness, preferring the later version only when equally complete. ",
+    "restartCandidates are locally measured restarts, where an earlier attempt is soon spoken again. Rows are ",
+    "[remove range, removeWords, keep range, keepWords, percent of removed words repeated in order, informative words only in the removed attempt, removed words]. ",
+    "Accept a candidate by copying its four ranges into a retake cut; they already have valid word boundaries, so no inspection is needed. ",
+    "Accept candidates with a high percentage and no unique words unless the repetition is intentional. ",
+    "Reject a candidate when its unique words carry information missing from the kept attempt, or keep that information with a different selection. ",
     "Before removing a version, check for unique facts, numbers, settings and qualifications absent from the kept version. Preserve them. ",
     "Compare meaning rather than exact wording: a paraphrase of the same instruction is not unique information. Preserve genuinely different steps. ",
     "Preserve natural breathing room at joins. Separated removals must leave at least 0.15 seconds of retained audio between them; adjacent removals may form a single join. ",
@@ -492,7 +498,7 @@ where
                         best = Some(draft);
                         input["draftForReview"] = json!(step);
                         input["reviewInstruction"] = json!(
-                            "Audit this draft against the entire supplied transcript before finishing. Check the recording lead-in, count-ins, abandoned starts, repeated passages, repeatHints and joinAlternatives for missed edits. Choose the clearest complete take or assembly, preserving every unique fact, number, setting, qualification and necessary connecting word. Verify each quiet gap was considered and preserve intentional waits, breathing room and demonstrations. Hints are candidates, not proof of duplication. Return the complete corrected proposal, including any earlier cuts and joins that remain valid; do not invent edits simply to change the draft."
+                            "Audit this draft against the entire supplied transcript before finishing. Check the recording lead-in, count-ins, abandoned starts, repeated passages, restartCandidates, repeatHints and joinAlternatives for missed edits; the result should play as a single take. Choose the clearest complete take or assembly, preserving every unique fact, number, setting, qualification and necessary connecting word. Verify each quiet gap was considered and preserve intentional waits, breathing room and demonstrations. Hints are candidates, not proof of duplication. Return the complete corrected proposal, including any earlier cuts and joins that remain valid; do not invent edits simply to change the draft."
                         );
                     }
                     Err(issue) if !correcting && call < MAX_CALLS => {
@@ -560,6 +566,7 @@ fn initial_input(
         "joinAlternatives": [], "nearbyRetakeHints": [],
     });
     if retakes {
+        input["restartCandidates"] = json!(super::restarts::evidence(utterances));
         input["takeGroups"] = json!(
             super::takes::take_groups(utterances)
                 .iter()
@@ -613,10 +620,30 @@ fn inspect(window: Option<UtteranceRange>, utterances: &[TimelineUtterance<'_>])
     ))
 }
 
+/// Utterance IDs that a step removes whole. Recording chatter said more than
+/// once ("1 2 3 4 5" count-ins before each clip) is not a repeated take when
+/// every copy is removed, so it needs no kept range.
+fn removed_whole(cuts: &[DraftCut]) -> std::collections::BTreeSet<u32> {
+    cuts.iter()
+        .filter(|cut| cut.remove_words.is_none() && cut.remove.first >= 1)
+        .flat_map(|cut| cut.remove.first..=cut.remove.last.min(cut.remove.first + 512))
+        .collect()
+}
+
 fn validate(
     step: Step,
     utterances: &[TimelineUtterance<'_>],
     gaps: &[Gap],
+) -> Result<Draft, &'static str> {
+    let removed = removed_whole(&step.cuts);
+    validate_with(step, utterances, gaps, &removed)
+}
+
+fn validate_with(
+    step: Step,
+    utterances: &[TimelineUtterance<'_>],
+    gaps: &[Gap],
+    removed: &std::collections::BTreeSet<u32>,
 ) -> Result<Draft, &'static str> {
     let summary = bounded(&step.summary, 1000);
     if summary.is_empty() || step.pauses.len() + step.cuts.len() + step.joins.len() > MAX_PROPOSALS
@@ -652,7 +679,7 @@ fn validate(
                     "For each retake, identify a valid kept range. Use null for other cuts.",
                 );
             }
-            if cut.kind != CutKind::Retake && cut.remove_words.is_none() && repeats_another_utterance(cut.remove, utterances) {
+            if cut.kind != CutKind::Retake && cut.remove_words.is_none() && repeats_another_utterance(cut.remove, utterances, removed) {
                 return Err("A proposed cut repeats another utterance. Use retake and identify the complete kept range, or preserve the material.");
             }
             Ok(CutChoice {
@@ -677,6 +704,7 @@ fn validate(
     if super::removes_all_speech(&proposals, utterances) {
         return Err("Preserve the assembled speech; these cuts remove all spoken content.");
     }
+    super::bridge(&mut proposals, utterances);
     if proposals.iter().enumerate().any(|(index, proposal)| {
         proposals[index + 1..]
             .iter()
@@ -704,6 +732,8 @@ fn partial_draft(
     }
     let mut candidates = Vec::new();
     let mut notes = Vec::new();
+    // Judge repeated chatter against the whole proposal, not the single cut.
+    let removed = removed_whole(&step.cuts);
     let base = Step {
         action: Action::Propose,
         window: None,
@@ -728,13 +758,14 @@ fn partial_draft(
     }
     for choice in step.cuts {
         let (first, last) = (choice.remove.first, choice.remove.last);
-        match validate(
+        match validate_with(
             Step {
                 cuts: vec![choice],
                 ..base.clone()
             },
             utterances,
             gaps,
+            &removed,
         ) {
             Ok(draft) => candidates.extend(draft.proposals),
             Err(reason) => notes.push(format!(
@@ -756,6 +787,7 @@ fn partial_draft(
             Err(reason) => notes.push(format!("Connection {id} was left unchanged. {reason}")),
         }
     }
+    super::bridge(&mut candidates, utterances);
     let mut proposals = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         if candidates
@@ -986,7 +1018,11 @@ fn words(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_lowercase)
 }
 
-fn repeats_another_utterance(range: UtteranceRange, utterances: &[TimelineUtterance<'_>]) -> bool {
+fn repeats_another_utterance(
+    range: UtteranceRange,
+    utterances: &[TimelineUtterance<'_>],
+    removed_elsewhere: &std::collections::BTreeSet<u32>,
+) -> bool {
     let Some(removed) = resolve(range, utterances) else {
         return false;
     };
@@ -996,6 +1032,7 @@ fn repeats_another_utterance(range: UtteranceRange, utterances: &[TimelineUttera
         && utterances.iter().enumerate().any(|(index, line)| {
             let id = index as u32 + 1;
             (id < range.first || id > range.last)
+                && !removed_elsewhere.contains(&id)
                 && words(line.text)
                     .take(removed.len())
                     .eq(removed.iter().cloned())
@@ -1346,6 +1383,37 @@ mod tests {
             approved.proposals[0].kept_text.as_deref(),
             Some(lines[2].text)
         );
+    }
+
+    #[test]
+    fn repeated_chatter_can_be_removed_when_every_copy_goes() {
+        // A count-in recorded before each clip repeats word for word.
+        let mut lines = lines();
+        lines[0].text = "1 2 3 4 5 Jai Ganpati Dada";
+        lines[2].text = "1 2 3 4 5 Jai Ganpati Dada";
+        let chatter = |id| {
+            let mut cut = cut(id, id);
+            cut["kind"] = json!("recordingChatter");
+            cut
+        };
+        let one = serde_json::from_value(proposal(json!([]), json!([chatter(1)]))).unwrap();
+        assert!(
+            validate(one, &lines, &[])
+                .err()
+                .unwrap()
+                .contains("repeats")
+        );
+        let both =
+            serde_json::from_value(proposal(json!([]), json!([chatter(1), chatter(3)]))).unwrap();
+        assert_eq!(validate(both, &lines, &[]).unwrap().proposals.len(), 2);
+        // Partial validation judges each cut against the whole proposal.
+        let mixed: Step = serde_json::from_value(proposal(
+            json!([]),
+            json!([chatter(1), chatter(3), cut(9, 9)]),
+        ))
+        .unwrap();
+        let draft = partial_draft(mixed, &lines, &[]).unwrap();
+        assert_eq!(draft.proposals.len(), 2, "{:?}", draft.notes);
     }
 
     #[tokio::test]

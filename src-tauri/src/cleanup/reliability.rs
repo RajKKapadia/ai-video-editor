@@ -287,6 +287,14 @@ async fn real_project_cleanup() {
         })
         .unwrap_or_default();
     let model = models::WhisperModel::LargeV3.file();
+    // Reuse transcripts saved by the app's OpenAI word-timestamp engine instead
+    // of transcribing locally; missing transcripts fail rather than upload audio.
+    let cached_openai = std::env::var("CUTLINE_REVIEW_CACHED_OPENAI").as_deref() == Ok("1");
+    let cache_model = if cached_openai {
+        super::transcription_api::CACHE_MODEL
+    } else {
+        model.checksum
+    };
     let models_dir = PathBuf::from(
         std::env::var_os("CUTLINE_REVIEW_MODEL_DIR")
             .expect("Set CUTLINE_REVIEW_MODEL_DIR to the downloaded speech-models directory."),
@@ -306,38 +314,44 @@ async fn real_project_cleanup() {
             .unwrap();
         let path = std::path::Path::new(clip["filePath"].as_str().unwrap());
         let key = linked_key(path).unwrap();
-        let analysis =
-            if let Some((analysis, _)) = cache.find(&key, run.source, Some(model.checksum), true) {
-                analysis
-            } else {
-                let audio = engine
-                    .prepare(&decoder, path, run.source, true, &control, |_| {})
-                    .unwrap();
-                let (utterances, fallback) = worker
-                    .transcribe(
-                        audio.pcm.unwrap().path(),
-                        audio.detected.clone(),
-                        run.source.duration(),
-                    )
-                    .unwrap();
-                let pauses = audio.detected.pauses();
-                cache.record(
-                    key,
-                    run.source,
-                    audio.detected,
-                    Some(Transcript {
-                        model: model.checksum.into(),
-                        alignment_version: ALIGNMENT_VERSION,
-                        device: if fallback { "CPU" } else { "CUDA" }.into(),
-                        utterances: utterances.clone(),
-                    }),
-                );
-                Analysis {
-                    pauses,
-                    utterances,
-                    motion: Vec::new(),
-                }
-            };
+        let analysis = if let Some((analysis, _)) =
+            cache.find(&key, run.source, Some(cache_model), true)
+        {
+            analysis
+        } else {
+            assert!(
+                !cached_openai,
+                "No cached OpenAI transcript covers {} at {:.2}–{:.2} s; analyze it in the app first.",
+                run.clip_id, run.source.start, run.source.end
+            );
+            let audio = engine
+                .prepare(&decoder, path, run.source, true, &control, |_| {})
+                .unwrap();
+            let (utterances, fallback) = worker
+                .transcribe(
+                    audio.pcm.unwrap().path(),
+                    audio.detected.clone(),
+                    run.source.duration(),
+                )
+                .unwrap();
+            let pauses = audio.detected.pauses();
+            cache.record(
+                key,
+                run.source,
+                audio.detected,
+                Some(Transcript {
+                    model: model.checksum.into(),
+                    alignment_version: ALIGNMENT_VERSION,
+                    device: if fallback { "CPU" } else { "CUDA" }.into(),
+                    utterances: utterances.clone(),
+                }),
+            );
+            Analysis {
+                pauses,
+                utterances,
+                motion: Vec::new(),
+            }
+        };
         results.push(Some(Arc::new(analysis)));
     }
     drop(worker);
@@ -369,6 +383,7 @@ async fn real_project_cleanup() {
     .unwrap();
     let report = json!({
         "duration": cursor, "summary": draft.summary, "proposals": draft.proposals, "notes": draft.notes,
+        "restartCandidates": assistant::restart_evidence(&lines),
         "transcript": lines.iter().map(|line| json!({"speech": line.speech, "cutStart": line.cut_start, "cutEnd": line.cut_end, "text": line.text, "words": line.words})).collect::<Vec<_>>(),
     });
     fs::write(
@@ -383,8 +398,12 @@ async fn real_project_cleanup() {
         draft.notes.len(),
         output.join("review.json").display()
     );
+    // The single-take pass reports restarts it added; that note is informational.
     assert!(
-        draft.notes.is_empty(),
+        draft
+            .notes
+            .iter()
+            .all(|note| note.starts_with("Added ") && note.contains("measured restart")),
         "Review includes unresolved edits; see the report."
     );
     if std::env::var("CUTLINE_REVIEW_EXPECT_NO_EDITS").as_deref() == Ok("1") {

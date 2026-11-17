@@ -121,12 +121,13 @@ pub(super) async fn run(
         },
     )
     .await;
-    // Check the combined result, across sections, for a single take of each line.
+    // Single-take pass over the whole timeline after sections are combined:
+    // add clear measured restarts, then report lines that still keep several takes.
     let result = result.map(|mut draft| {
         if compare_retakes {
-            draft
-                .notes
-                .extend(draft::single_take_notes(lines, &draft.proposals));
+            super::restarts::complete(&mut draft, lines);
+            let notes = draft::single_take_notes(lines, &draft.proposals);
+            draft.notes.extend(notes);
         }
         draft
     });
@@ -331,7 +332,7 @@ where
     if missing_gaps > 0 {
         notes.push(format!("{missing_gaps} quiet gaps could not be reviewed with complete neighboring context and were left unchanged."));
     }
-    let mut proposals = combine(proposals, &mut notes);
+    let mut proposals = combine(proposals, lines, &mut notes);
     if super::removes_all_speech(&proposals, lines) {
         proposals.clear();
         notes.push(
@@ -382,7 +383,11 @@ fn contains(outer: Range, inner: Range) -> bool {
     outer.start <= inner.start + 0.000_001 && outer.end >= inner.end - 0.000_001
 }
 
-fn combine(mut proposals: Vec<Proposal>, notes: &mut Vec<String>) -> Vec<Proposal> {
+fn combine(
+    mut proposals: Vec<Proposal>,
+    lines: &[TimelineUtterance<'_>],
+    notes: &mut Vec<String>,
+) -> Vec<Proposal> {
     proposals.sort_by(|left, right| {
         left.remove
             .start
@@ -412,6 +417,7 @@ fn combine(mut proposals: Vec<Proposal>, notes: &mut Vec<String>) -> Vec<Proposa
     proposals.dedup_by(|left, right| {
         left.kind == right.kind && left.remove == right.remove && left.keep == right.keep
     });
+    super::bridge(&mut proposals, lines);
     let valid: Vec<_> = proposals
         .iter()
         .enumerate()
@@ -574,15 +580,40 @@ mod tests {
             kept_text: None,
             reason: None,
         };
+        // A sliver holding speech is an audible fragment: reject both edits.
+        let speech = [TimelineUtterance {
+            run: 0,
+            ordinal: 0,
+            last: true,
+            speech: Range::new(2.02, 2.08),
+            cut_start: None,
+            cut_end: None,
+            text: "Hi",
+            words: Vec::new(),
+        }];
         let mut notes = Vec::new();
-        assert!(combine(vec![pause(1.0, 2.0), pause(2.1, 3.0)], &mut notes).is_empty());
+        assert!(combine(vec![pause(1.0, 2.0), pause(2.1, 3.0)], &speech, &mut notes).is_empty());
         assert!(!notes.is_empty());
+        // A silent sliver is joined into one edit instead of stranding a frame.
+        let joined = combine(vec![pause(1.0, 2.0), pause(2.1, 3.0)], &[], &mut Vec::new());
+        assert_eq!(joined.len(), 2);
+        assert_eq!(joined[0].remove, Range::new(1.0, 2.1));
         assert_eq!(
-            combine(vec![pause(1.0, 2.0), pause(2.0, 3.0)], &mut Vec::new()).len(),
+            combine(
+                vec![pause(1.0, 2.0), pause(2.0, 3.0)],
+                &speech,
+                &mut Vec::new()
+            )
+            .len(),
             2
         );
         assert_eq!(
-            combine(vec![pause(1.0, 2.0), pause(2.15, 3.0)], &mut Vec::new()).len(),
+            combine(
+                vec![pause(1.0, 2.0), pause(2.15, 3.0)],
+                &speech,
+                &mut Vec::new()
+            )
+            .len(),
             2
         );
     }
@@ -629,7 +660,7 @@ mod tests {
             take(Range::new(10.0, 12.0), Range::new(20.2, 21.8)),
         ];
         let mut notes = Vec::new();
-        let combined = combine(proposals, &mut notes);
+        let combined = combine(proposals, &[], &mut notes);
         assert_eq!(combined.len(), 2);
         assert!(
             combined
