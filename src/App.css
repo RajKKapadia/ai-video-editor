@@ -199,6 +199,15 @@ kbd {
 .button.secondary:hover {
   background: #303135;
 }
+.button.danger {
+  color: #fff3ef;
+  background: #a8473b;
+  border-color: #a8473b;
+}
+.button.danger:hover {
+  background: #bd5446;
+  border-color: #bd5446;
+}
 .button.subtle {
   color: #a4a4ad;
   padding: 7px 10px;
@@ -681,6 +690,44 @@ kbd {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 21px;
 }
+.project-item {
+  position: relative;
+  min-width: 0;
+  display: flex;
+}
+.project-item > .project-card {
+  flex: 1;
+}
+.project-delete {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #ffffff24;
+  border-radius: 6px;
+  color: #e6e1dc;
+  background: #121316c4;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+}
+.project-item:hover .project-delete,
+.project-delete:focus-visible {
+  opacity: 1;
+}
+.project-delete:hover {
+  color: #fff3ef;
+  background: #a8473b;
+  border-color: #a8473b;
+}
+@media (hover: none) {
+  .project-delete {
+    opacity: 1;
+  }
+}
 .project-card {
   text-align: left;
   border: 1px solid #303136;
@@ -832,6 +879,11 @@ kbd {
   display: flex;
   align-items: stretch;
   min-height: 100px;
+}
+.project-list .project-delete {
+  top: 50%;
+  right: 50px;
+  transform: translateY(-50%);
 }
 .project-list .project-cover {
   width: 180px;
@@ -1230,6 +1282,53 @@ kbd {
   font-weight: 500;
   font-size: 10px;
   margin-top: 2px;
+}
+.import-progress {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0 14px;
+}
+.import-progress strong {
+  font-weight: 500;
+  font-size: 10px;
+  color: #d9cfc8;
+}
+.import-progress > span {
+  color: #8a8792;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.import-progress-bar {
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: #2c2c31;
+  overflow: hidden;
+}
+.import-progress-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #9a785f, var(--accent), #9a785f);
+  background-size: 200% 100%;
+  animation: import-shimmer 1.4s linear infinite;
+  transition: width 0.3s ease;
+}
+@keyframes import-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .import-progress-bar > i {
+    animation: none;
+  }
+}
+.import-zone:disabled {
+  cursor: progress;
 }
 .import-zone > span {
   color: #6b6b77;
@@ -2501,6 +2600,11 @@ kbd {
   border-radius: 12px;
   margin: 23px 0 15px;
   color: #d7ac8c;
+}
+.modal-symbol.danger {
+  color: #e88a7c;
+  background: #3a2421;
+  border-color: #5e3530;
 }
 .modal-intro {
   font-size: 11px;

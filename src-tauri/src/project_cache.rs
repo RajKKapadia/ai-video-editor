@@ -208,7 +208,32 @@ fn save_current(
         return Ok(false);
     }
     save(path, snapshot, existing.is_some())?;
+    if let (Some(existing), Some(workspace)) = (existing, path.parent()) {
+        remove_deleted_transcripts(workspace, &existing, snapshot);
+    }
     Ok(true)
+}
+
+/// Deleting a project from the dashboard also drops its stored transcript.
+fn remove_deleted_transcripts(
+    workspace: &Path,
+    previous: &ProjectSnapshot,
+    current: &ProjectSnapshot,
+) {
+    let kept: std::collections::HashSet<&str> = current
+        .projects
+        .iter()
+        .filter_map(|project| project["id"].as_str())
+        .collect();
+    for id in previous
+        .projects
+        .iter()
+        .filter_map(|project| project["id"].as_str())
+        .filter(|id| !kept.contains(id))
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    {
+        let _ = fs::remove_file(transcript_path(workspace, id));
+    }
 }
 
 #[tauri::command]
@@ -359,6 +384,13 @@ mod tests {
         let path = workspace.join("transcripts/project-my-project.json");
         let saved: Value = serde_json::from_reader(File::open(path).unwrap()).unwrap();
         assert_eq!(saved, latest);
+
+        let removed = ProjectSnapshot {
+            revision: "removed".into(),
+            projects: vec![],
+        };
+        assert!(save_current(&projects, Some("first"), &removed).unwrap());
+        assert!(!workspace.join("transcripts/project-my-project.json").exists());
 
         fs::remove_dir_all(&workspace).unwrap();
         assert!(store_project_transcript(&projects, "my-project", &latest).is_err());
