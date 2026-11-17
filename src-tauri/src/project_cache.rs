@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fs::{self, File},
     io::{self, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
@@ -8,6 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tempfile::NamedTempFile;
@@ -208,31 +209,93 @@ fn save_current(
         return Ok(false);
     }
     save(path, snapshot, existing.is_some())?;
-    if let (Some(existing), Some(workspace)) = (existing, path.parent()) {
-        remove_deleted_transcripts(workspace, &existing, snapshot);
+    if let (Some(existing), Some(workspace)) = (existing, path.parent())
+        && project_ids(&existing).any(|id| !project_ids(snapshot).any(|kept| kept == id))
+    {
+        remove_orphaned_project_files(workspace, snapshot);
     }
     Ok(true)
 }
 
-/// Deleting a project from the dashboard also drops its stored transcript.
-fn remove_deleted_transcripts(
-    workspace: &Path,
-    previous: &ProjectSnapshot,
-    current: &ProjectSnapshot,
-) {
-    let kept: std::collections::HashSet<&str> = current
+fn project_ids(snapshot: &ProjectSnapshot) -> impl Iterator<Item = &str> {
+    snapshot
         .projects
         .iter()
         .filter_map(|project| project["id"].as_str())
-        .collect();
-    for id in previous
-        .projects
-        .iter()
-        .filter_map(|project| project["id"].as_str())
-        .filter(|id| !kept.contains(id))
-        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+/// Which project a workspace file belongs to, by the ID or ID hash in its name.
+enum Owner<'a> {
+    Id(&'a str),
+    Hash(&'a str),
+}
+
+fn workspace_file_owner(name: &str) -> Option<Owner<'_>> {
+    if let Some(id) = name
+        .strip_prefix("speech-analysis-")
+        .and_then(|rest| rest.strip_suffix(".json"))
     {
-        let _ = fs::remove_file(transcript_path(workspace, id));
+        return Some(Owner::Id(id));
+    }
+    if let Some(rest) = name.strip_prefix("transcripts-") {
+        // SQLite keeps -wal, -shm and -journal files beside the database.
+        let id = ["", "-wal", "-shm", "-journal"]
+            .iter()
+            .find_map(|suffix| rest.strip_suffix(&format!(".sqlite3{suffix}")))?;
+        return Some(Owner::Id(id));
+    }
+    name.strip_prefix("cleanup-review-")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .map(Owner::Hash)
+}
+
+/// Remove everything the app stored for projects that are no longer in the
+/// snapshot: speech analysis, transcript database, stored transcript and
+/// cleanup reviews. Linked original media lives elsewhere and is never touched.
+fn remove_orphaned_project_files(workspace: &Path, snapshot: &ProjectSnapshot) {
+    let ids: HashSet<&str> = project_ids(snapshot).collect();
+    let hashes: HashSet<String> = ids
+        .iter()
+        .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
+        .collect();
+    let orphaned = |owner: Owner| match owner {
+        Owner::Id(id) => !ids.contains(id),
+        Owner::Hash(hash) => !hashes.contains(hash),
+    };
+    let files = |folder: PathBuf| {
+        fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+    };
+    for entry in files(workspace.to_owned()) {
+        if let Some(name) = entry.file_name().to_str()
+            && workspace_file_owner(name).is_some_and(orphaned)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    for entry in files(workspace.join("transcripts")) {
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("project-")?.strip_suffix(".json"))
+            && !ids.contains(id)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    for entry in files(workspace.join("cleanup-reviews")) {
+        if let Some(hash) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json")?.split_once('-'))
+            .map(|(project, _)| project)
+            && orphaned(Owner::Hash(hash))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -241,8 +304,13 @@ pub(crate) async fn load_project_cache(app: AppHandle) -> Result<Option<ProjectS
     tauri::async_runtime::spawn_blocking(move || {
         let cache = app.state::<ProjectCache>();
         let _guard = cache.io.lock().unwrap();
-        let snapshot = load(&cache_path(&app)?)?;
+        let path = cache_path(&app)?;
+        let snapshot = load(&path)?;
         if let Some(snapshot) = &snapshot {
+            // Sweep files left by projects deleted before this cleanup existed.
+            if let Some(workspace) = path.parent() {
+                remove_orphaned_project_files(workspace, snapshot);
+            }
             cache.remember_paths(snapshot.paths());
         }
         Ok(snapshot)
@@ -390,11 +458,78 @@ mod tests {
             projects: vec![],
         };
         assert!(save_current(&projects, Some("first"), &removed).unwrap());
-        assert!(!workspace.join("transcripts/project-my-project.json").exists());
+        assert!(
+            !workspace
+                .join("transcripts/project-my-project.json")
+                .exists()
+        );
 
         fs::remove_dir_all(&workspace).unwrap();
         assert!(store_project_transcript(&projects, "my-project", &latest).is_err());
         assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn deleting_a_project_removes_everything_stored_for_it() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let projects = workspace.join("projects.json");
+        let snapshot = |revision: &str, ids: &[&str]| ProjectSnapshot {
+            revision: revision.into(),
+            projects: ids.iter().map(|id| serde_json::json!({"id": id})).collect(),
+        };
+        assert!(save_current(&projects, None, &snapshot("first", &["keep", "gone"])).unwrap());
+        fs::create_dir(workspace.join("transcripts")).unwrap();
+        fs::create_dir(workspace.join("cleanup-reviews")).unwrap();
+        let files_for = |id: &str| {
+            let hash = format!("{:x}", Sha256::digest(id.as_bytes()));
+            vec![
+                format!("speech-analysis-{id}.json"),
+                format!("transcripts-{id}.sqlite3"),
+                format!("transcripts-{id}.sqlite3-wal"),
+                format!("transcripts-{id}.sqlite3-journal"),
+                format!("transcripts/project-{id}.json"),
+                format!("cleanup-review-{hash}.json"),
+                format!("cleanup-reviews/{hash}-0a1b.json"),
+                format!("cleanup-reviews/{hash}-2c3d.json"),
+            ]
+        };
+        let unrelated = [
+            "notes.json",
+            "transcripts/readme.txt",
+            "cleanup-reviews/other",
+        ];
+        for name in files_for("keep")
+            .iter()
+            .chain(&files_for("gone"))
+            .map(String::as_str)
+            .chain(unrelated)
+        {
+            fs::write(workspace.join(name), b"{}").unwrap();
+        }
+
+        assert!(save_current(&projects, Some("first"), &snapshot("second", &["keep"])).unwrap());
+        for name in files_for("gone") {
+            assert!(!workspace.join(&name).exists(), "{name} should be deleted");
+        }
+        for name in files_for("keep")
+            .iter()
+            .map(String::as_str)
+            .chain(unrelated)
+        {
+            assert!(workspace.join(name).exists(), "{name} should be kept");
+        }
+
+        // Files left behind earlier are swept when the workspace is opened.
+        for name in files_for("gone") {
+            fs::write(workspace.join(name), b"{}").unwrap();
+        }
+        remove_orphaned_project_files(&workspace, &load(&projects).unwrap().unwrap());
+        for name in files_for("gone") {
+            assert!(!workspace.join(&name).exists(), "{name} should be swept");
+        }
+        assert!(projects.exists());
+        assert!(workspace.join("speech-analysis-keep.json").exists());
     }
 
     #[test]
