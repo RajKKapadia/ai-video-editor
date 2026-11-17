@@ -22,7 +22,7 @@ export type ProviderStatus = {
 export type ProviderSelection = { provider: Provider; config: ProviderConfig };
 
 export type CleanupProgress = { stage: string; fraction: number | null };
-export type AssistantStage = 'draft' | 'pauses' | 'cuts' | 'chat';
+export type AssistantStage = 'draft' | 'pauses' | 'cuts' | 'chat' | 'instruct';
 export type AssistantRequest = { stage: AssistantStage; message: string; provider: ProviderSelection };
 export type CleanupOptions = { pauses: boolean; retakes: ProviderSelection | null; assistant?: AssistantRequest };
 
@@ -36,6 +36,57 @@ export function hasAnalyzableAudio(clip: Clip | undefined) {
 
 export function errorMessage(error: unknown, fallback: string) {
   return typeof error === 'string' ? error : error instanceof Error ? error.message : fallback;
+}
+
+type AgentReport = CleanupReport & { agentEdits: { id: number; remove: { start: number; end: number } }[] };
+
+/**
+ * Edits the timeline from an instruction using the transcript already stored
+ * for this project. Nothing is decoded or transcribed; parts of the timeline
+ * without a stored transcript are reported in the review notes.
+ */
+export async function instructTimeline(
+  projectId: string,
+  timeline: Segment[],
+  clips: ReadonlyMap<string, Clip>,
+  request: AssistantRequest,
+  signal: AbortSignal,
+  update: (progress: CleanupProgress) => void,
+): Promise<CleanupReport> {
+  const id = uid();
+  const cancel = () => { void invoke('agent_cancel', { id }).catch(() => {}); };
+  signal.throwIfAborted();
+  signal.addEventListener('abort', cancel, { once: true });
+  update({ stage: 'Editing from the stored transcript', fraction: null });
+  try {
+    const { agentEdits, ...report } = await invoke<AgentReport>('agent_run', {
+      id,
+      projectId,
+      segments: timeline.map((segment) => {
+        const clip = clips.get(segment.clipId);
+        return {
+          clipId: segment.clipId,
+          in: segment.in,
+          out: segment.out,
+          analyze: hasAnalyzableAudio(clip),
+          filePath: clip?.filePath ?? null,
+        };
+      }),
+      message: request.message,
+      provider: request.provider,
+    });
+    signal.throwIfAborted();
+    // Carry each edit's ID on its proposal so it survives partial applies.
+    return {
+      ...report,
+      proposals: report.proposals.map((proposal) => {
+        const edit = agentEdits.find(({ remove }) => remove.start === proposal.remove.start && remove.end === proposal.remove.end);
+        return edit ? { ...proposal, editId: edit.id } : proposal;
+      }),
+    };
+  } finally {
+    signal.removeEventListener('abort', cancel);
+  }
 }
 
 export async function analyzeTimeline(

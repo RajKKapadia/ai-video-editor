@@ -627,6 +627,7 @@ mod tests {
     }
     fn cut(start: f64, end: f64) -> Proposal {
         Proposal {
+            watch: false,
             kind: "splice",
             remove: Range::new(start, end),
             keep: None,
@@ -683,10 +684,12 @@ mod tests {
             line("Hello everyone again", 5.0),
         ];
         let pause = Proposal {
+            watch: false,
             kind: "pause",
             ..cut(1.5, 4.7)
         };
         let invalid_pause = Proposal {
+            watch: false,
             kind: "pause",
             ..cut(4.7, 5.5)
         };

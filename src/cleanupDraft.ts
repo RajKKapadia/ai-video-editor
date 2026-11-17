@@ -5,7 +5,7 @@ import type { Segment } from './types';
 export type CleanupReview = {
   snapshot: Segment[];
   report: CleanupReport;
-  assistant?: 'draft' | 'pauses' | 'cuts';
+  assistant?: 'draft' | 'pauses' | 'cuts' | 'instruct';
 };
 
 export type SavedCleanupDraft = {
@@ -36,7 +36,8 @@ function validReport(value: unknown): value is CleanupReport {
   return Array.isArray(report.proposals) && report.proposals.every((proposal) => proposal &&
     ['pause', 'retake', 'cut', 'splice'].includes(proposal.kind) && validRange(proposal.remove) &&
     (proposal.keep == null || validRange(proposal.keep)) && optionalText(proposal.reason) &&
-    optionalText(proposal.removedText) && optionalText(proposal.keptText)) &&
+    optionalText(proposal.removedText) && optionalText(proposal.keptText) &&
+    (proposal.editId === undefined || Number.isSafeInteger(proposal.editId))) &&
     optionalText(report.retakeIssue) && optionalText(report.transcriptCacheIssue) &&
     optionalText(report.processingDevice) && optionalText(report.runtimeNotice) && optionalText(report.draftSummary) &&
     (report.speech == null || (typeof report.speech.model === 'string' && Object.prototype.hasOwnProperty.call(whisperModels, report.speech.model) &&
@@ -72,7 +73,7 @@ export function restoreCleanupDraft(value: unknown, timeline: Segment[]): SavedC
   if (saved.version !== 1 || !Array.isArray(saved.checked)) return null;
   const review = saved.review;
   if (review && (!sameTimeline(review.snapshot, timeline) || !validReport(review.report) ||
-    (review.assistant !== undefined && !['draft', 'pauses', 'cuts'].includes(review.assistant)))) return null;
+    (review.assistant !== undefined && !['draft', 'pauses', 'cuts', 'instruct'].includes(review.assistant)))) return null;
   if (saved.pendingCuts != null && !sameTimeline(saved.pendingCuts, timeline)) return null;
   if (!review && !saved.pendingCuts) return null;
   if (review && review.report.proposals.some(({ remove }) => !makeCleanupEdit(timeline, [remove], review.report.canClearTimeline))) return null;

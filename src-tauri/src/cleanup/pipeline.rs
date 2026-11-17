@@ -255,6 +255,10 @@ fn decode(
     session.control.check()
 }
 
+/// Two sources failing one after another means the engine or key is at fault,
+/// not the recordings, so transcription stops for the rest of the timeline.
+const MAX_FAILURES_IN_ROW: usize = 2;
+
 fn collect(
     prepared: Receiver<(usize, PreparedRange, Vec<Option<f64>>)>,
     transcriber: &mut Option<Transcriber<'_>>,
@@ -272,6 +276,11 @@ fn collect(
     let mut failed = HashSet::new();
     let mut text_bytes = 0;
     let mut issue = None;
+    // Per-source transcription failures. Other sources keep their transcripts
+    // unless failures repeat back to back, which points at the engine or key.
+    let mut untranscribed: Vec<(usize, String)> = Vec::new();
+    let mut failures_in_row = 0;
+    let mut transcribed_any = false;
     let mut notice = None;
     let mut devices = HashSet::new();
     let mut device = if remote.is_some() {
@@ -292,8 +301,14 @@ fn collect(
             }
         };
         let result = match audio {
-            PreparedRange::Repeated(first, _) => results[first].clone(),
+            PreparedRange::Repeated(first, _) => {
+                if let Some((_, error)) = untranscribed.iter().find(|(run, _)| *run == first) {
+                    untranscribed.push((index, error.clone()));
+                }
+                results[first].clone()
+            }
             PreparedRange::Cached(mut analysis, device, _) => {
+                transcribed_any |= model.is_some();
                 devices.extend(device);
                 analysis.motion = motion;
                 Some(Arc::new(analysis))
@@ -336,6 +351,8 @@ fn collect(
                     };
                     match outcome {
                         Ok((utterances, fallback)) => {
+                            failures_in_row = 0;
+                            transcribed_any = true;
                             result.utterances = utterances;
                             if fallback {
                                 device = "CPU";
@@ -357,7 +374,13 @@ fn collect(
                                 utterances: result.utterances.clone(),
                             });
                         }
-                        Err(error) => issue = Some(error),
+                        Err(error) => {
+                            failures_in_row += 1;
+                            if failures_in_row >= MAX_FAILURES_IN_ROW {
+                                issue = Some(error.clone());
+                            }
+                            untranscribed.push((index, error));
+                        }
                     }
                     session.control.check()?;
                 }
@@ -437,6 +460,15 @@ fn collect(
         devices.into_iter().next()
     };
     data.failed.extend(failed);
+    if issue.is_none()
+        && !transcribed_any
+        && let Some((_, error)) = untranscribed.first()
+    {
+        issue = Some(error.clone());
+    }
+    if issue.is_none() {
+        data.untranscribed = untranscribed;
+    }
     if let Some(issue) = issue {
         data.retake_issue = Some(issue);
         data.connection = None;

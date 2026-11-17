@@ -14,7 +14,7 @@ import { CleanupPanel } from './CleanupPanel';
 import { remainingCleanupReview, restoreCleanupDraft, type CleanupReview, type SavedCleanupDraft } from './cleanupDraft';
 import { ExportPanel } from './ExportPanel';
 import { Icon, type IconName } from './Icon';
-import { adaptiveCleanupBrief, analyzeTimeline, errorMessage, hasAnalyzableAudio, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
+import { adaptiveCleanupBrief, analyzeTimeline, errorMessage, hasAnalyzableAudio, instructTimeline, type AssistantRequest, type CleanupOptions, type CleanupProgress } from './cleanupNative';
 import { canPreviewCleanupDraft, makeCleanupEdit, minSegmentDuration, prepareCleanupReview, type AssistantMessage, type TimeRange } from './cleanupTimeline';
 import { inspectMedia, storeMedia } from './cache';
 import { importConcurrency, mapConcurrent } from './resources';
@@ -594,11 +594,13 @@ export function Editor({
     cleanupJob.current = job;
     if (stage !== 'chat' && snapshot === project.timeline) resetCleanupPreview();
     if (stage === 'cuts') setPendingCuts(snapshot);
-    if (stage === 'pauses' || stage === 'draft') setPendingCuts(null);
+    if (stage === 'pauses' || stage === 'draft' || stage === 'instruct') setPendingCuts(null);
     setCleanupError('');
     setCleanupProgress({ stage: stage ? 'Preparing the timeline assistant' : 'Preparing timeline cleanup', fraction: null });
     try {
-      const result = await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
+      const result = stage === 'instruct' && options.assistant
+        ? await instructTimeline(project.id, job.snapshot, clipById, options.assistant, job.controller.signal, setCleanupProgress)
+        : await analyzeTimeline(project.id, job.snapshot, clipById, options, job.controller.signal, setCleanupProgress);
       const report = prepareCleanupReview(job.snapshot, result);
       if (cleanupJob.current !== job || job.controller.signal.aborted) return;
       if (stage === 'draft' && !canPreviewCleanupDraft(snapshot, report)) {
@@ -662,6 +664,12 @@ export function Editor({
     if (!cleanupEdit || !currentReview || cleanupJob.current) return;
     const position = previewing ? sequenceTime : cleanupEdit.mapTime(sequenceTime);
     const remaining = nextAssistantStage ? null : remainingCleanupReview(currentReview, checkedCuts, cleanupEdit);
+    const appliedEdits = currentReview.report.proposals.flatMap((proposal, index) =>
+      checkedCuts.has(index) && proposal.editId !== undefined ? [proposal.editId] : []);
+    if (appliedEdits.length) {
+      // The edit log only informs later instructions; a failed write never blocks Apply.
+      void invoke('agent_edits_applied', { projectId: project.id, ids: appliedEdits }).catch(() => {});
+    }
     changeTimeline(cleanupEdit.timeline, currentReview.snapshot, remaining
       ? { version: 1, review: remaining, checked: [], pendingCuts: null } : undefined);
     setCleanupReview(remaining);
@@ -683,7 +691,7 @@ export function Editor({
     resetCleanupPreview();
     setCheckedCuts((checked) => new Set([
       ...checked,
-      ...(cleanupReport?.proposals.flatMap((cut, index) => (cut.kind === 'pause') === pauses ? [index] : []) ?? []),
+      ...(cleanupReport?.proposals.flatMap((cut, index) => (cut.kind === 'pause') === pauses && !cut.watch ? [index] : []) ?? []),
     ]));
   }
 

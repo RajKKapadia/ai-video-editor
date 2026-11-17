@@ -366,6 +366,7 @@ mod tests {
         let groups = take_groups(&lines);
         assert_eq!(unresolved(&groups, &[], &lines).len(), 1);
         let cut = Proposal {
+            watch: false,
             kind: "retake",
             remove: Range::new(-0.1, 2.1),
             keep: Some(lines[1].speech),

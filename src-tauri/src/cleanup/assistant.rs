@@ -535,6 +535,7 @@ fn pause_proposals(gaps: &[Gap], choices: Vec<PauseChoice>) -> (Vec<Proposal>, u
                 return None;
             };
             Some(Proposal {
+                watch: false,
                 kind: "pause",
                 remove,
                 keep: None,
@@ -576,6 +577,7 @@ fn cut_proposals(utterances: &[TimelineUtterance<'_>], choices: Vec<CutChoice>) 
                 return None;
             }
             Some(Proposal {
+                watch: false,
                 kind: if keep.is_some() { "retake" } else { "cut" },
                 remove,
                 keep,

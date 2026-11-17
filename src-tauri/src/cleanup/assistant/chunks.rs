@@ -566,6 +566,7 @@ mod tests {
     #[test]
     fn rejects_rushed_micro_fragments_but_allows_a_single_adjacent_join() {
         let pause = |start, end| Proposal {
+            watch: false,
             kind: "pause",
             remove: Range::new(start, end),
             keep: None,
@@ -615,6 +616,7 @@ mod tests {
     #[test]
     fn a_kept_take_can_be_replaced_by_a_more_complete_distant_take_without_conflicts() {
         let take = |remove, keep| Proposal {
+            watch: false,
             kind: "retake",
             remove,
             keep: Some(keep),
@@ -678,6 +680,7 @@ mod tests {
                     let early = local.iter().find(|line| line.ordinal == 4).unwrap();
                     let late = local.iter().find(|line| line.ordinal == 95).unwrap();
                     vec![Proposal {
+                        watch: false,
                         kind: "retake",
                         remove: Range::new(early.cut_start.unwrap(), early.cut_end.unwrap()),
                         keep: Some(late.speech),

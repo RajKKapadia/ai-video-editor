@@ -109,4 +109,24 @@ describe('saved cleanup drafts', () => {
     verified.review!.report.verification.checkedPreviews = -1;
     expect(restoreCleanupDraft(verified, timeline)).toBeNull();
   });
+
+  test('instruction reviews restore and keep edit IDs on the suggestions left after a partial apply', () => {
+    const instruct: CleanupReview = { snapshot: timeline, assistant: 'instruct', report: {
+      draftSummary: 'Removed two fillers.', failedSources: 0, retakeIssue: null, transcriptCacheIssue: null,
+      proposals: [
+        { kind: 'cut', remove: { start: 2, end: 2.4 }, keep: null, removedText: 'um', keptText: null, editId: 7 },
+        { kind: 'cut', remove: { start: 9, end: 9.5 }, keep: null, removedText: 'basically', keptText: null, editId: 8 },
+      ],
+    } };
+    const restored = restoreCleanupDraft(roundtrip({ ...saved, review: instruct, checked: [0] }), roundtrip(timeline))!;
+    expect(restored.review!.assistant).toBe('instruct');
+    const edit = makeCleanupEdit(timeline, [instruct.report.proposals[0].remove])!;
+    const remaining = remainingCleanupReview(restored.review!, new Set([0]), edit)!;
+    expect(remaining.report.proposals).toHaveLength(1);
+    expect(remaining.report.proposals[0].editId).toBe(8);
+    expect(remaining.report.proposals[0].remove.start).toBeCloseTo(8.6);
+    const broken = roundtrip({ ...saved, review: instruct });
+    (broken.review!.report.proposals[0] as { editId: unknown }).editId = 'seven';
+    expect(restoreCleanupDraft(broken, timeline)).toBeNull();
+  });
 });
